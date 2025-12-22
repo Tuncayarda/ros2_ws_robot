@@ -1,0 +1,23 @@
+# ROS 2 workspace artifacts
+build/
+install/
+log/
+
+# colcon
+*.egg-info/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
