@@ -51,31 +51,43 @@ static inline bool ends_with_ci(const std::string& s, const std::string& suffix)
 class LcdNode : public rclcpp::Node {
 public:
   LcdNode()
-  : Node("lcd_node"), spi_fd_(-1), chip_(nullptr), line_dc_(nullptr), line_rst_(nullptr)
+  : Node("lcd_node"),
+    spi_fd_(-1),
+    chip_(nullptr),
+    line_dc_(nullptr),
+    line_rst_(nullptr)
   {
-    // Params
+    // Core params
     declare_parameter<int>("fps", 30);
     declare_parameter<bool>("loop", true);
     declare_parameter<bool>("show_test", false);
     declare_parameter<bool>("rotate_cw_90", true);
 
-    // SPI
-    declare_parameter<int>("spi_hz", 20000000);      // istersen 8_000_000 yap
-    declare_parameter<int>("spi_chunk", 4096);       // hızlı için 4096
+    // SPI params
+    declare_parameter<int>("spi_hz", 20000000);
+    declare_parameter<int>("spi_chunk", 4096);
 
     // Topics
     declare_parameter<std::string>("topic_media_path", "/lcd/media_path");
     declare_parameter<std::string>("topic_image", "/lcd/image");
 
+    // ROI params
+    declare_parameter<bool>("roi_enable", true);
+    declare_parameter<int>("roi_pad", 2);
+
     fps_  = std::max<int>(1, (int)get_parameter("fps").as_int());
     loop_ = get_parameter("loop").as_bool();
     show_test_ = get_parameter("show_test").as_bool();
     rotate_cw_90_ = get_parameter("rotate_cw_90").as_bool();
+
     spi_hz_ = std::max<int>(1000000, (int)get_parameter("spi_hz").as_int());
     spi_chunk_ = std::max<int>(256, (int)get_parameter("spi_chunk").as_int());
 
     topic_media_path_ = get_parameter("topic_media_path").as_string();
     topic_image_      = get_parameter("topic_image").as_string();
+
+    roi_enable_ = get_parameter("roi_enable").as_bool();
+    roi_pad_    = std::max<int>(0, (int)get_parameter("roi_pad").as_int());
 
     RCLCPP_INFO(get_logger(), "LCD node starting...");
 
@@ -85,7 +97,7 @@ public:
     hw_reset();
     init_lcd();
 
-    // Subscriptions (node açılınca dinlemeye başlar)
+    // Subscriptions
     sub_path_ = create_subscription<std_msgs::msg::String>(
       topic_media_path_, 10,
       [this](std_msgs::msg::String::SharedPtr msg){
@@ -100,16 +112,20 @@ public:
       }
     );
 
-    RCLCPP_INFO(get_logger(), "Listening: %s (String path) | %s (sensor_msgs/Image)",
-                topic_media_path_.c_str(), topic_image_.c_str());
+    RCLCPP_INFO(get_logger(),
+      "Listening: %s (String path) | %s (sensor_msgs/Image) | ROI=%d pad=%d",
+      topic_media_path_.c_str(),
+      topic_image_.c_str(),
+      (int)roi_enable_, roi_pad_
+    );
 
     if (show_test_) {
       RCLCPP_INFO(get_logger(), "show_test=true -> running test colors. Publish to topics to override.");
       timer_ = create_wall_timer(1000ms, [this]{ test_color_tick(); });
       fill_screen(0xF800);
     } else {
-      fill_screen(0x0000); // black
-      RCLCPP_INFO(get_logger(), "Ready. Publish media_path or Image to start.");
+      fill_screen(0x0000);
+      RCLCPP_INFO(get_logger(), "Ready. Publish /lcd/media_path or /lcd/image to start.");
     }
   }
 
@@ -162,7 +178,7 @@ private:
       tr.rx_buf = 0;
       tr.len = n;
       tr.delay_usecs = 0;
-      tr.speed_hz = 0;       // configured speed
+      tr.speed_hz = 0;       // use configured speed
       tr.bits_per_word = 8;
 
       int ret = ioctl(spi_fd_, SPI_IOC_MESSAGE(1), &tr);
@@ -275,7 +291,6 @@ private:
 
   // ---------------- Playback control ----------------
   void stop_current_playback() {
-    // token artır -> çalışan thread kendi kendine durur
     play_token_.fetch_add(1);
     running_.store(false);
     if (media_thread_.joinable()) media_thread_.join();
@@ -287,26 +302,18 @@ private:
            ends_with_ci(p, ".jpeg") || ends_with_ci(p, ".bmp");
   }
 
-  // Topic: String path
   void on_media_path(const std::string& path) {
     if (path.empty()) return;
 
-    {
-      std::lock_guard<std::mutex> lk(src_mtx_);
-      current_path_ = path;
-      current_is_path_ = true;
-    }
-
-    // eskiyi kes
     stop_current_playback();
 
-    // yeni token ile başlat
     const uint64_t my_token = play_token_.load();
     running_.store(true);
 
-    // LCD işi sesin önüne geçmesin diye (ama hızlı da kalsın)
+    // LCD thread sesin önüne geçmesin (çok düşürme; 5 yeter)
     setpriority(PRIO_PROCESS, 0, 5);
 
+    // Path image
     if (is_image_path(path)) {
       RCLCPP_INFO(get_logger(), "NEW PATH (image): %s", path.c_str());
       cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
@@ -318,21 +325,17 @@ private:
       return;
     }
 
-    RCLCPP_INFO(get_logger(), "NEW PATH (video): %s fps=%d loop=%d rotate_cw_90=%d",
-                path.c_str(), fps_, (int)loop_, (int)rotate_cw_90_);
+    // Path video
+    RCLCPP_INFO(get_logger(), "NEW PATH (video): %s fps=%d loop=%d rotate_cw_90=%d ROI=%d",
+                path.c_str(), fps_, (int)loop_, (int)rotate_cw_90_, (int)roi_enable_);
 
     media_thread_ = std::thread([this, path, my_token]{
       video_loop(path, my_token);
     });
   }
 
-  // Topic: sensor_msgs/Image
   void on_image(const sensor_msgs::msg::Image& msg) {
-    // eski video vs varsa kes
     stop_current_playback();
-
-    // token güncel
-    play_token_.fetch_add(1);
 
     cv::Mat bgr;
     if (!image_msg_to_bgr(msg, bgr)) {
@@ -340,22 +343,17 @@ private:
       return;
     }
 
-    RCLCPP_INFO(get_logger(), "NEW IMAGE MSG: %dx%d encoding=%s",
+    RCLCPP_INFO(get_logger(), "NEW IMAGE MSG: %ux%u encoding=%s",
                 msg.width, msg.height, msg.encoding.c_str());
 
     render_bgr_frame(bgr);
   }
 
   bool image_msg_to_bgr(const sensor_msgs::msg::Image& msg, cv::Mat& out_bgr) {
-    // Beklenenler: "bgr8" veya "rgb8"
     const std::string enc = to_lower(msg.encoding);
-    if (enc != "bgr8" && enc != "rgb8") {
-      return false;
-    }
-
+    if (enc != "bgr8" && enc != "rgb8") return false;
     if (msg.step == 0 || msg.data.empty()) return false;
 
-    // wrap
     cv::Mat m((int)msg.height, (int)msg.width, CV_8UC3,
               const_cast<unsigned char*>(msg.data.data()),
               (size_t)msg.step);
@@ -364,8 +362,6 @@ private:
       out_bgr = m.clone();
       return true;
     }
-
-    // rgb8 -> bgr
     cv::cvtColor(m, out_bgr, cv::COLOR_RGB2BGR);
     return true;
   }
@@ -382,7 +378,6 @@ private:
 
     cv::Mat frame;
     while (running_.load()) {
-      // yeni bir şey geldiyse kendini bırak
       if (play_token_.load() != token) break;
 
       if (!cap.read(frame) || frame.empty()) {
@@ -400,46 +395,86 @@ private:
     }
   }
 
-  // ---- FAST render: full-window once, then stream lines ----
+  // ---------------- Render (ROI + Fast) ----------------
   void render_bgr_frame(const cv::Mat& bgr) {
     cv::Mat rotated;
-    if (rotate_cw_90_) {
-      cv::rotate(bgr, rotated, cv::ROTATE_90_CLOCKWISE);
-    } else {
-      rotated = bgr;
-    }
+    if (rotate_cw_90_) cv::rotate(bgr, rotated, cv::ROTATE_90_CLOCKWISE);
+    else rotated = bgr;
 
     cv::Mat resized;
     cv::resize(rotated, resized, cv::Size(LCD_WIDTH, LCD_HEIGHT), 0, 0, cv::INTER_LINEAR);
 
-    // window full screen ONCE (hız)
-    set_addr_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-
-    std::vector<uint8_t> line((size_t)LCD_WIDTH * 2);
-
+    // 1) frame -> RGB565 uint16_t
+    std::vector<uint16_t> cur565((size_t)LCD_WIDTH * (size_t)LCD_HEIGHT);
     for (int y = 0; y < LCD_HEIGHT; ++y) {
       const cv::Vec3b* row = resized.ptr<cv::Vec3b>(y);
-
-      size_t idx = 0;
+      size_t rowoff = (size_t)y * LCD_WIDTH;
       for (int x = 0; x < LCD_WIDTH; ++x) {
-        uint8_t B = row[x][0];
-        uint8_t G = row[x][1];
-        uint8_t R = row[x][2];
-
+        uint8_t B = row[x][0], G = row[x][1], R = row[x][2];
         uint16_t rgb565 =
           ((R & 0xF8) << 8) |
           ((G & 0xFC) << 3) |
           ((B & 0xF8) >> 3);
+        cur565[rowoff + (size_t)x] = rgb565;
+      }
+    }
 
-        line[idx++] = (rgb565 >> 8) & 0xFF;
-        line[idx++] = rgb565 & 0xFF;
+    int minx = 0, miny = 0, maxx = LCD_WIDTH - 1, maxy = LCD_HEIGHT - 1;
+
+    if (roi_enable_ && prev_valid_ && prev565_.size() == cur565.size()) {
+      minx = LCD_WIDTH; miny = LCD_HEIGHT; maxx = -1; maxy = -1;
+
+      for (int y = 0; y < LCD_HEIGHT; ++y) {
+        size_t rowoff = (size_t)y * LCD_WIDTH;
+        for (int x = 0; x < LCD_WIDTH; ++x) {
+          uint16_t a = cur565[rowoff + (size_t)x];
+          uint16_t b = prev565_[rowoff + (size_t)x];
+          if (a != b) {
+            if (x < minx) minx = x;
+            if (y < miny) miny = y;
+            if (x > maxx) maxx = x;
+            if (y > maxy) maxy = y;
+          }
+        }
       }
 
+      // no diff
+      if (maxx < 0) {
+        prev565_.swap(cur565);
+        prev_valid_ = true;
+        return;
+      }
+
+      // pad
+      minx = std::max(0, minx - roi_pad_);
+      miny = std::max(0, miny - roi_pad_);
+      maxx = std::min(LCD_WIDTH - 1,  maxx + roi_pad_);
+      maxy = std::min(LCD_HEIGHT - 1, maxy + roi_pad_);
+    }
+
+    // 2) set window once
+    set_addr_window(minx, miny, maxx, maxy);
+
+    // 3) stream ROI lines
+    const int roi_w = maxx - minx + 1;
+    std::vector<uint8_t> line((size_t)roi_w * 2);
+
+    for (int y = miny; y <= maxy; ++y) {
+      size_t idx = 0;
+      size_t rowoff = (size_t)y * LCD_WIDTH;
+      for (int x = minx; x <= maxx; ++x) {
+        uint16_t v = cur565[rowoff + (size_t)x];
+        line[idx++] = (v >> 8) & 0xFF;
+        line[idx++] = v & 0xFF;
+      }
       write_data_buf(line.data(), line.size());
     }
+
+    prev565_.swap(cur565);
+    prev_valid_ = true;
   }
 
-  // ---------- Test ----------
+  // ---------------- Test ----------------
   void test_color_tick() {
     static const uint16_t colors[] = {0xF800,0x07E0,0x001F};
     test_idx_ = (test_idx_ + 1) % 3;
@@ -459,6 +494,9 @@ private:
   std::string topic_media_path_{"/lcd/media_path"};
   std::string topic_image_{"/lcd/image"};
 
+  bool roi_enable_{true};
+  int roi_pad_{2};
+
   // hw
   int spi_fd_;
   gpiod_chip *chip_;
@@ -475,9 +513,9 @@ private:
   std::thread media_thread_;
   std::atomic<uint64_t> play_token_{1};
 
-  std::mutex src_mtx_;
-  std::string current_path_;
-  bool current_is_path_{true};
+  // ROI history
+  std::vector<uint16_t> prev565_;
+  bool prev_valid_{false};
 
   int test_idx_{0};
 };
