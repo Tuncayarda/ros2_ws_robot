@@ -11,12 +11,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <sys/resource.h>   // setpriority
 #include <errno.h>
 
 #include "rclcpp/rclcpp.hpp"
@@ -57,37 +56,27 @@ public:
     line_dc_(nullptr),
     line_rst_(nullptr)
   {
-    // Core params
+    // ---------- Core params ----------
     declare_parameter<int>("fps", 30);
     declare_parameter<bool>("loop", true);
     declare_parameter<bool>("show_test", false);
     declare_parameter<bool>("rotate_cw_90", true);
 
-    // SPI params
+    // ---------- SPI params ----------
     declare_parameter<int>("spi_hz", 20000000);
-    declare_parameter<int>("spi_chunk", 4096);
+    declare_parameter<int>("spi_chunk", 32768);          // ✅ bigger default
+    declare_parameter<bool>("spi_use_multi_ioc", false); // optional advanced mode
 
-    // Topics
+    // ---------- Topics ----------
     declare_parameter<std::string>("topic_media_path", "/lcd/media_path");
     declare_parameter<std::string>("topic_image", "/lcd/image");
 
-    // ROI params
+    // ---------- ROI params ----------
     declare_parameter<bool>("roi_enable", true);
     declare_parameter<int>("roi_pad", 2);
 
-    fps_  = std::max<int>(1, (int)get_parameter("fps").as_int());
-    loop_ = get_parameter("loop").as_bool();
-    show_test_ = get_parameter("show_test").as_bool();
-    rotate_cw_90_ = get_parameter("rotate_cw_90").as_bool();
-
-    spi_hz_ = std::max<int>(1000000, (int)get_parameter("spi_hz").as_int());
-    spi_chunk_ = std::max<int>(256, (int)get_parameter("spi_chunk").as_int());
-
-    topic_media_path_ = get_parameter("topic_media_path").as_string();
-    topic_image_      = get_parameter("topic_image").as_string();
-
-    roi_enable_ = get_parameter("roi_enable").as_bool();
-    roi_pad_    = std::max<int>(0, (int)get_parameter("roi_pad").as_int());
+    // ---------- Apply params ----------
+    reload_params();
 
     RCLCPP_INFO(get_logger(), "LCD node starting...");
 
@@ -97,7 +86,7 @@ public:
     hw_reset();
     init_lcd();
 
-    // Subscriptions
+    // ---------- Subscriptions ----------
     sub_path_ = create_subscription<std_msgs::msg::String>(
       topic_media_path_, 10,
       [this](std_msgs::msg::String::SharedPtr msg){
@@ -112,13 +101,11 @@ public:
       }
     );
 
-    RCLCPP_INFO(get_logger(),
-      "Listening: %s (String path) | %s (sensor_msgs/Image) | ROI=%d pad=%d",
-      topic_media_path_.c_str(),
-      topic_image_.c_str(),
-      (int)roi_enable_, roi_pad_
-    );
+    // ---------- SPI worker thread ----------
+    running_.store(true);
+    spi_worker_ = std::thread([this]{ spi_worker_loop(); });
 
+    // ---------- test ----------
     if (show_test_) {
       RCLCPP_INFO(get_logger(), "show_test=true -> running test colors. Publish to topics to override.");
       timer_ = create_wall_timer(1000ms, [this]{ test_color_tick(); });
@@ -127,10 +114,27 @@ public:
       fill_screen(0x0000);
       RCLCPP_INFO(get_logger(), "Ready. Publish /lcd/media_path or /lcd/image to start.");
     }
+
+    RCLCPP_INFO(get_logger(),
+      "Listening: %s (String path) | %s (sensor_msgs/Image) | ROI=%d pad=%d | fps=%d | spi_hz=%d | chunk=%d | multi_ioc=%d",
+      topic_media_path_.c_str(),
+      topic_image_.c_str(),
+      (int)roi_enable_, roi_pad_,
+      fps_, spi_hz_, spi_chunk_, (int)spi_use_multi_ioc_
+    );
   }
 
   ~LcdNode() override {
     stop_current_playback();
+
+    running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(frame_mtx_);
+      frame_ready_ = true;
+    }
+    frame_cv_.notify_all();
+    if (spi_worker_.joinable()) spi_worker_.join();
+
     if (line_dc_)  gpiod_line_release(line_dc_);
     if (line_rst_) gpiod_line_release(line_rst_);
     if (chip_)     gpiod_chip_close(chip_);
@@ -138,6 +142,24 @@ public:
   }
 
 private:
+  // ---------- params reload ----------
+  void reload_params() {
+    fps_  = std::max<int>(1, (int)get_parameter("fps").as_int());
+    loop_ = get_parameter("loop").as_bool();
+    show_test_ = get_parameter("show_test").as_bool();
+    rotate_cw_90_ = get_parameter("rotate_cw_90").as_bool();
+
+    spi_hz_ = std::max<int>(1000000, (int)get_parameter("spi_hz").as_int());
+    spi_chunk_ = std::max<int>(256, (int)get_parameter("spi_chunk").as_int());
+    spi_use_multi_ioc_ = get_parameter("spi_use_multi_ioc").as_bool();
+
+    topic_media_path_ = get_parameter("topic_media_path").as_string();
+    topic_image_      = get_parameter("topic_image").as_string();
+
+    roi_enable_ = get_parameter("roi_enable").as_bool();
+    roi_pad_    = std::max<int>(0, (int)get_parameter("roi_pad").as_int());
+  }
+
   // ---------------- SPI ----------------
   bool open_spi() {
     spi_fd_ = ::open(SPI_DEV, O_RDWR);
@@ -163,12 +185,13 @@ private:
       return false;
     }
 
-    RCLCPP_INFO(get_logger(), "SPI opened %s mode=0 speed=%uHz bits=%u chunk=%d",
-                SPI_DEV, speed, bits, spi_chunk_);
+    RCLCPP_INFO(get_logger(), "SPI opened %s mode=0 speed=%uHz bits=%u chunk=%d multi_ioc=%d",
+                SPI_DEV, speed, bits, spi_chunk_, (int)spi_use_multi_ioc_);
     return true;
   }
 
-  bool spi_write_chunked(const uint8_t *data, size_t len) {
+  bool spi_write_chunked_single_ioc(const uint8_t *data, size_t len) {
+    // Old style but with bigger chunk (still ok)
     size_t off = 0;
     while (off < len) {
       size_t n = std::min((size_t)spi_chunk_, len - off);
@@ -178,7 +201,7 @@ private:
       tr.rx_buf = 0;
       tr.len = n;
       tr.delay_usecs = 0;
-      tr.speed_hz = 0;       // use configured speed
+      tr.speed_hz = 0;
       tr.bits_per_word = 8;
 
       int ret = ioctl(spi_fd_, SPI_IOC_MESSAGE(1), &tr);
@@ -189,6 +212,39 @@ private:
       off += n;
     }
     return true;
+  }
+
+  bool spi_write_chunked_multi_ioc(const uint8_t *data, size_t len) {
+    // One ioctl with many transfers (reduces syscalls further)
+    // We cap transfers count to avoid huge stack; allocate vector.
+    size_t off = 0;
+    std::vector<spi_ioc_transfer> trs;
+    trs.reserve((len / spi_chunk_) + 2);
+
+    while (off < len) {
+      size_t n = std::min((size_t)spi_chunk_, len - off);
+      spi_ioc_transfer tr{};
+      tr.tx_buf = reinterpret_cast<unsigned long>(data + off);
+      tr.rx_buf = 0;
+      tr.len = n;
+      tr.delay_usecs = 0;
+      tr.speed_hz = 0;
+      tr.bits_per_word = 8;
+      trs.push_back(tr);
+      off += n;
+    }
+
+    int ret = ioctl(spi_fd_, SPI_IOC_MESSAGE((int)trs.size()), trs.data());
+    if (ret < 0) {
+      RCLCPP_ERROR(get_logger(), "SPI write failed (multi_ioc transfers=%zu) errno=%d", trs.size(), errno);
+      return false;
+    }
+    return true;
+  }
+
+  bool spi_write(const uint8_t *data, size_t len) {
+    if (spi_use_multi_ioc_) return spi_write_chunked_multi_ioc(data, len);
+    return spi_write_chunked_single_ioc(data, len);
   }
 
   // ---------------- GPIO ----------------
@@ -226,15 +282,15 @@ private:
   // ---------------- LCD low-level ----------------
   void write_cmd(uint8_t cmd) {
     set_dc(0);
-    spi_write_chunked(&cmd, 1);
+    spi_write(&cmd, 1);
   }
   void write_data(uint8_t data) {
     set_dc(1);
-    spi_write_chunked(&data, 1);
+    spi_write(&data, 1);
   }
   void write_data_buf(const uint8_t *data, size_t len) {
     set_dc(1);
-    spi_write_chunked(data, len);
+    spi_write(data, len);
   }
 
   void init_lcd() {
@@ -243,7 +299,7 @@ private:
 
     write_cmd(0x3A); write_data(0x55); // RGB565
 
-    write_cmd(0x36); write_data(0x08); // MADCTL BGR (sende doğru)
+    write_cmd(0x36); write_data(0x08); // MADCTL BGR
     write_cmd(0x20);                   // INVOFF
     usleep(10000);
 
@@ -279,20 +335,18 @@ private:
 
   void fill_screen(uint16_t color) {
     set_addr_window(0,0,LCD_WIDTH-1,LCD_HEIGHT-1);
-    std::vector<uint8_t> line(LCD_WIDTH*2);
-    for (int i=0;i<LCD_WIDTH;i++){
-      line[2*i]   = (color>>8)&0xFF;
-      line[2*i+1] = color&0xFF;
+    std::vector<uint8_t> buf((size_t)LCD_WIDTH * (size_t)LCD_HEIGHT * 2);
+    for (int i=0;i<LCD_WIDTH*LCD_HEIGHT;i++){
+      buf[2*i]   = (color>>8)&0xFF;
+      buf[2*i+1] = color&0xFF;
     }
-    for (int y=0;y<LCD_HEIGHT;y++){
-      write_data_buf(line.data(), line.size());
-    }
+    write_data_buf(buf.data(), buf.size());
   }
 
   // ---------------- Playback control ----------------
   void stop_current_playback() {
     play_token_.fetch_add(1);
-    running_.store(false);
+    media_running_.store(false);
     if (media_thread_.joinable()) media_thread_.join();
   }
 
@@ -308,12 +362,8 @@ private:
     stop_current_playback();
 
     const uint64_t my_token = play_token_.load();
-    running_.store(true);
+    media_running_.store(true);
 
-    // LCD thread sesin önüne geçmesin (çok düşürme; 5 yeter)
-    setpriority(PRIO_PROCESS, 0, 5);
-
-    // Path image
     if (is_image_path(path)) {
       RCLCPP_INFO(get_logger(), "NEW PATH (image): %s", path.c_str());
       cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
@@ -321,11 +371,10 @@ private:
         RCLCPP_ERROR(get_logger(), "Failed to read image: %s", path.c_str());
         return;
       }
-      render_bgr_frame(img);
+      render_bgr_frame_enqueue(img);
       return;
     }
 
-    // Path video
     RCLCPP_INFO(get_logger(), "NEW PATH (video): %s fps=%d loop=%d rotate_cw_90=%d ROI=%d",
                 path.c_str(), fps_, (int)loop_, (int)rotate_cw_90_, (int)roi_enable_);
 
@@ -346,7 +395,7 @@ private:
     RCLCPP_INFO(get_logger(), "NEW IMAGE MSG: %ux%u encoding=%s",
                 msg.width, msg.height, msg.encoding.c_str());
 
-    render_bgr_frame(bgr);
+    render_bgr_frame_enqueue(bgr);
   }
 
   bool image_msg_to_bgr(const sensor_msgs::msg::Image& msg, cv::Mat& out_bgr) {
@@ -377,7 +426,7 @@ private:
     auto next = std::chrono::steady_clock::now();
 
     cv::Mat frame;
-    while (running_.load()) {
+    while (media_running_.load()) {
       if (play_token_.load() != token) break;
 
       if (!cap.read(frame) || frame.empty()) {
@@ -388,15 +437,16 @@ private:
         break;
       }
 
-      render_bgr_frame(frame);
+      render_bgr_frame_enqueue(frame);
 
       next += period;
       std::this_thread::sleep_until(next);
     }
   }
 
-  // ---------------- Render (ROI + Fast) ----------------
-  void render_bgr_frame(const cv::Mat& bgr) {
+  // ---------------- Producer: frame->rgb565 + ROI compute -> enqueue ----------------
+  void render_bgr_frame_enqueue(const cv::Mat& bgr) {
+    // rotate + resize
     cv::Mat rotated;
     if (rotate_cw_90_) cv::rotate(bgr, rotated, cv::ROTATE_90_CLOCKWISE);
     else rotated = bgr;
@@ -404,7 +454,7 @@ private:
     cv::Mat resized;
     cv::resize(rotated, resized, cv::Size(LCD_WIDTH, LCD_HEIGHT), 0, 0, cv::INTER_LINEAR);
 
-    // 1) frame -> RGB565 uint16_t
+    // cur565 as uint16
     std::vector<uint16_t> cur565((size_t)LCD_WIDTH * (size_t)LCD_HEIGHT);
     for (int y = 0; y < LCD_HEIGHT; ++y) {
       const cv::Vec3b* row = resized.ptr<cv::Vec3b>(y);
@@ -438,40 +488,75 @@ private:
         }
       }
 
-      // no diff
       if (maxx < 0) {
         prev565_.swap(cur565);
         prev_valid_ = true;
         return;
       }
 
-      // pad
       minx = std::max(0, minx - roi_pad_);
       miny = std::max(0, miny - roi_pad_);
       maxx = std::min(LCD_WIDTH - 1,  maxx + roi_pad_);
       maxy = std::min(LCD_HEIGHT - 1, maxy + roi_pad_);
     }
 
-    // 2) set window once
-    set_addr_window(minx, miny, maxx, maxy);
-
-    // 3) stream ROI lines
+    // Build ONE contiguous RGB565 byte buffer for ROI
     const int roi_w = maxx - minx + 1;
-    std::vector<uint8_t> line((size_t)roi_w * 2);
+    const int roi_h = maxy - miny + 1;
+    std::vector<uint8_t> roi_bytes((size_t)roi_w * (size_t)roi_h * 2);
 
+    size_t idx = 0;
     for (int y = miny; y <= maxy; ++y) {
-      size_t idx = 0;
       size_t rowoff = (size_t)y * LCD_WIDTH;
       for (int x = minx; x <= maxx; ++x) {
         uint16_t v = cur565[rowoff + (size_t)x];
-        line[idx++] = (v >> 8) & 0xFF;
-        line[idx++] = v & 0xFF;
+        roi_bytes[idx++] = (v >> 8) & 0xFF;
+        roi_bytes[idx++] = v & 0xFF;
       }
-      write_data_buf(line.data(), line.size());
     }
+
+    // enqueue "latest frame" (drop older)
+    {
+      std::lock_guard<std::mutex> lk(frame_mtx_);
+      pending_.minx = minx;
+      pending_.miny = miny;
+      pending_.maxx = maxx;
+      pending_.maxy = maxy;
+      pending_.rgb565_bytes.swap(roi_bytes);
+      frame_ready_ = true;
+    }
+    frame_cv_.notify_one();
 
     prev565_.swap(cur565);
     prev_valid_ = true;
+  }
+
+  // ---------------- Consumer: SPI worker only ----------------
+  struct PendingFrame {
+    int minx{0}, miny{0}, maxx{LCD_WIDTH-1}, maxy{LCD_HEIGHT-1};
+    std::vector<uint8_t> rgb565_bytes;
+  };
+
+  void spi_worker_loop() {
+    while (running_.load()) {
+      PendingFrame local;
+
+      {
+        std::unique_lock<std::mutex> lk(frame_mtx_);
+        frame_cv_.wait(lk, [this]{ return frame_ready_; });
+        if (!running_.load()) break;
+
+        local = std::move(pending_);
+        pending_ = PendingFrame{};
+        frame_ready_ = false;
+      }
+
+      if (local.rgb565_bytes.empty()) continue;
+
+      // window once, then one big write
+      set_addr_window(local.minx, local.miny, local.maxx, local.maxy);
+      write_data_buf(local.rgb565_bytes.data(), local.rgb565_bytes.size());
+    }
   }
 
   // ---------------- Test ----------------
@@ -489,7 +574,8 @@ private:
   bool rotate_cw_90_{true};
 
   int spi_hz_{20000000};
-  int spi_chunk_{4096};
+  int spi_chunk_{32768};
+  bool spi_use_multi_ioc_{false};
 
   std::string topic_media_path_{"/lcd/media_path"};
   std::string topic_image_{"/lcd/image"};
@@ -509,9 +595,18 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   // playback
-  std::atomic<bool> running_{false};
+  std::atomic<bool> media_running_{false};
   std::thread media_thread_;
   std::atomic<uint64_t> play_token_{1};
+
+  // SPI worker
+  std::atomic<bool> running_{false};
+  std::thread spi_worker_;
+
+  std::mutex frame_mtx_;
+  std::condition_variable frame_cv_;
+  PendingFrame pending_;
+  bool frame_ready_{false};
 
   // ROI history
   std::vector<uint16_t> prev565_;

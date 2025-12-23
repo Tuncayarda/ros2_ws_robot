@@ -105,16 +105,29 @@ def generate_launch_description():
         name="lcd_node",
         output="screen",
         parameters=[{
-            "fps": 30,
-            "loop": True,
-            "show_test": False,
-            "rotate_cw_90": True,
-            "spi_hz": 20000000,
-            "spi_chunk": 4096,
-            "topic_media_path": "/lcd/media_path",
-            "topic_image": "/lcd/image",
+            "fps": 20,
             "roi_enable": True,
             "roi_pad": 2,
+            "spi_hz": 20000000,
+            "spi_chunk": 32768,
+            "spi_use_multi_ioc": False,
+            "rotate_cw_90": True,
+        }],
+    )
+
+    audio = Node(
+        package="audio_player",
+        executable="audio_player_node",
+        name="audio_player_node",
+        output="screen",
+        parameters=[{
+            "topic_path": "/audio/path",
+            "topic_url":  "/audio/url",
+            "topic_stop": "/audio/stop",
+            "player": "mpv",
+            "volume": 20,
+            "ytdl": True,
+            "alsa_device": "",
         }],
     )
 
@@ -126,4 +139,5 @@ def generate_launch_description():
         neopixel,
         servo,
         lcd,
+        audio,
     ])
