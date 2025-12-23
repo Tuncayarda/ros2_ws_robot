@@ -22,7 +22,7 @@ public:
   {
     // ---------- Params ----------
     chip_path_   = declare_parameter<std::string>("chip", "/dev/gpiochip4");
-    line_offset_ = declare_parameter<int>("gpio", 12);          // BCM numarası = gpiochip line offset (Pi'de genelde aynı)
+    line_offset_ = declare_parameter<int>("gpio", 12);
     topic_       = declare_parameter<std::string>("topic", "/servo/angle_deg");
 
     min_us_    = declare_parameter<int>("min_us", 500);
@@ -31,8 +31,11 @@ public:
     max_deg_   = declare_parameter<double>("max_deg", 180.0);
 
     period_us_     = declare_parameter<int>("period_us", 20000); // 50Hz
-    max_step_us_   = declare_parameter<int>("max_step_us", 15);  // yumuşatma
-    rt_priority_   = declare_parameter<int>("rt_priority", 60);   // root/CAP_SYS_NICE varsa işe yarar
+    max_step_us_   = declare_parameter<int>("max_step_us", 15);  // yumuşatma (pulse us/frame)
+    rt_priority_   = declare_parameter<int>("rt_priority", 60);
+
+    // Yeni: hedefe ulaştıktan sonra kaç ms daha PWM basıp sonra keselim
+    hold_ms_       = declare_parameter<int>("hold_ms", 500);
 
     // ---------- GPIO (libgpiod) init ----------
     chip_ = gpiod_chip_open(chip_path_.c_str());
@@ -52,9 +55,10 @@ public:
       throw std::runtime_error("gpiod_line_request_output failed (permission?)");
     }
 
-    // başlangıç: orta
+    // başlangıç: orta ama PWM’i aktif etme (aktiflik açı gelince başlar)
     target_us_.store((min_us_ + max_us_) / 2);
     current_us_.store(target_us_.load());
+    active_.store(false);
 
     // ---------- Subscriber ----------
     sub_ = create_subscription<std_msgs::msg::Float32>(
@@ -64,6 +68,10 @@ public:
         const double t = (deg - min_deg_) / std::max(1e-9, (max_deg_ - min_deg_));
         const int pulse = (int)std::lround(min_us_ + t * (max_us_ - min_us_));
         target_us_.store(std::clamp(pulse, min_us_, max_us_));
+
+        // Yeni komut geldi: PWM’i başlat
+        active_.store(true);
+        last_cmd_ns_.store(now_ns());
       }
     );
 
@@ -72,8 +80,8 @@ public:
     worker_ = std::thread([this] { this->worker_loop(); });
 
     RCLCPP_INFO(get_logger(),
-      "servo_softpwm_node ready. chip=%s gpio=%d topic=%s pulse=[%dus..%dus] period=%dus max_step_us=%d",
-      chip_path_.c_str(), line_offset_, topic_.c_str(), min_us_, max_us_, period_us_, max_step_us_);
+      "servo_driver_node ready. chip=%s gpio=%d topic=%s pulse=[%dus..%dus] period=%dus step=%dus hold_ms=%d",
+      chip_path_.c_str(), line_offset_, topic_.c_str(), min_us_, max_us_, period_us_, max_step_us_, hold_ms_);
   }
 
   ~ServoSoftPwmNode() override
@@ -81,7 +89,6 @@ public:
     running_.store(false);
     if (worker_.joinable()) worker_.join();
 
-    // GPIO low + release
     if (line_) {
       gpiod_line_set_value(line_, 0);
       gpiod_line_release(line_);
@@ -98,6 +105,12 @@ private:
     return std::max(lo, std::min(hi, v));
   }
 
+  static long long now_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  }
+
   void try_set_realtime_priority()
   {
     setpriority(PRIO_PROCESS, 0, -10);
@@ -105,27 +118,47 @@ private:
     sched_param sch{};
     sch.sched_priority = std::clamp(rt_priority_, 1, 99);
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sch);
-    // root/CAP_SYS_NICE yoksa başarısız olur; problem değil.
   }
 
   static void sleep_ns(long ns)
   {
+    if (ns <= 0) return;
     timespec ts{};
     ts.tv_sec  = ns / 1000000000L;
     ts.tv_nsec = ns % 1000000000L;
     clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
   }
 
+  void pwm_frame(int pulse_us)
+  {
+    const long period_ns = (long)period_us_ * 1000L;
+    const long high_ns   = (long)pulse_us * 1000L;
+    const long low_ns    = std::max(0L, period_ns - high_ns);
+
+    gpiod_line_set_value(line_, 1);
+    sleep_ns(high_ns);
+    gpiod_line_set_value(line_, 0);
+    sleep_ns(low_ns);
+  }
+
   void worker_loop()
   {
     try_set_realtime_priority();
 
-    const long period_ns = (long)period_us_ * 1000L;
+    bool was_at_target = false;
+    long long reached_time_ns = 0;
 
     while (running_.load()) {
-      // yumuşatma (her 50Hz frame'de yaklaş)
+
+      if (!active_.load()) {
+        gpiod_line_set_value(line_, 0);
+        sleep_ns(5'000'000);
+        continue;
+      }
+
       int cur = current_us_.load();
       int tgt = target_us_.load();
+
       if (cur != tgt) {
         int diff = tgt - cur;
         int step = std::clamp(diff, -max_step_us_, max_step_us_);
@@ -133,43 +166,58 @@ private:
         current_us_.store(cur);
       }
 
-      const long high_ns = (long)current_us_.load() * 1000L;
-      const long low_ns  = std::max(0L, period_ns - high_ns);
+      bool at_target = (current_us_.load() == target_us_.load());
 
-      // HIGH
-      gpiod_line_set_value(line_, 1);
-      sleep_ns(high_ns);
+      if (at_target) {
+        if (!was_at_target) {
+          reached_time_ns = now_ns();
+          was_at_target = true;
+        } else {
+          long long dt_ms = (now_ns() - reached_time_ns) / 1'000'000LL;
+          if (dt_ms >= (long long)hold_ms_) {
+            // PWM’i kes
+            active_.store(false);
+            gpiod_line_set_value(line_, 0);
+            was_at_target = false;
+            continue;
+          }
+        }
+      } else {
+        was_at_target = false;
+      }
 
-      // LOW
-      gpiod_line_set_value(line_, 0);
-      sleep_ns(low_ns);
+      // aktifken PWM frame bas
+      pwm_frame(current_us_.load());
     }
   }
 
 private:
-    // params
-    std::string chip_path_{"/dev/gpiochip4"};
-    int line_offset_{12};
-    std::string topic_{"/servo/angle_deg"};
+  // params
+  std::string chip_path_{"/dev/gpiochip4"};
+  int line_offset_{12};
+  std::string topic_{"/servo/angle_deg"};
 
-    int min_us_{500}, max_us_{2500};
-    double min_deg_{0.0}, max_deg_{180.0};
+  int min_us_{500}, max_us_{2500};
+  double min_deg_{0.0}, max_deg_{180.0};
 
-    int period_us_{20000};
-    int max_step_us_{15};
-    int rt_priority_{60};
+  int period_us_{20000};
+  int max_step_us_{15};
+  int rt_priority_{60};
+  int hold_ms_{500};
 
-    // gpio
-    gpiod_chip *chip_{nullptr};
-    gpiod_line *line_{nullptr};
+  // gpio
+  gpiod_chip *chip_{nullptr};
+  gpiod_line *line_{nullptr};
 
-    // state
-    std::atomic<bool> running_{false};
-    std::atomic<int> target_us_{1500};
-    std::atomic<int> current_us_{1500};
+  // state
+  std::atomic<bool> running_{false};
+  std::atomic<bool> active_{false};
+  std::atomic<int> target_us_{1500};
+  std::atomic<int> current_us_{1500};
+  std::atomic<long long> last_cmd_ns_{0};
 
-    std::thread worker_;
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_;
+  std::thread worker_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_;
 };
 
 int main(int argc, char **argv)
