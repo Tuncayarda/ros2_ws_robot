@@ -11,15 +11,9 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
-# =========================================================
-# FIXED RESOLUTION (ONLY 320x240)
-# =========================================================
 W_TARGET = 320
 H_TARGET = 240
 
-# =========================================================
-# DEFAULT SETTINGS (✅ 320x240 tuned)
-# =========================================================
 OUTLINE_K = 5
 EDGE_THICKNESS = 2
 
@@ -195,6 +189,7 @@ def _centerline_and_edges_from_cluster(
 
             len1 = sum(s[4] for s in g1)
             len2 = sum(s[4] for s in g2)
+
             sep = abs(mu2 - mu1)
 
             if (len1 >= min_group_len and len2 >= min_group_len and
@@ -250,6 +245,8 @@ def _centerline_and_edges_from_cluster(
 
 
 def edge_to_structures(edge255: np.ndarray, params: dict):
+    h, w = edge255.shape
+
     linesP = cv2.HoughLinesP(
         edge255, 1, np.pi / 180.0, params["hough_thresh"],
         minLineLength=params["hough_min_len"], maxLineGap=params["hough_max_gap"]
@@ -274,7 +271,7 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
     structs = []
     for c in clusters:
         st = _centerline_and_edges_from_cluster(
-            c, edge255.shape[1], edge255.shape[0],
+            c, w, h,
             params["min_parallel_sep"], params["max_parallel_sep"],
             params["min_group_len"], params["min_t_overlap"],
             params["draw_single_edge"],
@@ -297,6 +294,9 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
     return structs
 
 
+# =========================
+# OPTIMIZED PREPROCESS
+# =========================
 class PreprocCache:
     def __init__(self, outline_k: int, edge_thickness: int):
         self.k_grad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outline_k, outline_k))
@@ -324,21 +324,19 @@ class PreprocCache:
         bin255[:, -px:] = 0
 
 
+# =========================================================
+# INFO METRICS (READ-ONLY; DOES NOT AFFECT DRAWING)
+# =========================================================
 def angle_to_vertical_signed_deg(x1, y1, x2, y2) -> float:
     """
-    Signed angle relative to vertical red line.
-    Image coords: +x right, +y down.
-    We define:
-      0 deg = vertical (up/down)
-      + = leaning to the right
-      - = leaning to the left
+    0 deg = vertical (red line).
+    + => leaning right, - => leaning left.
     """
     dx = float(x2 - x1)
     dy = float(y2 - y1)
     if abs(dx) < 1e-6 and abs(dy) < 1e-6:
         return 0.0
-    ang = np.degrees(np.arctan2(dx, dy))  # atan2(x, y) => relative to vertical axis
-    # wrap to [-90, +90] roughly
+    ang = np.degrees(np.arctan2(dx, dy))  # relative to vertical axis
     if ang > 90.0:
         ang -= 180.0
     if ang < -90.0:
@@ -346,6 +344,40 @@ def angle_to_vertical_signed_deg(x1, y1, x2, y2) -> float:
     return float(ang)
 
 
+def line_x_at_y(x1, y1, x2, y2, y_query):
+    """
+    x position where infinite line through (x1,y1)-(x2,y2) crosses y=y_query.
+    Returns None if horizontal.
+    """
+    y1f, y2f = float(y1), float(y2)
+    if abs(y2f - y1f) < 1e-6:
+        return None
+    t = (float(y_query) - y1f) / (y2f - y1f)
+    return float(x1) + t * float(x2 - x1)
+
+
+def compute_confidence(s: dict) -> float:
+    """
+    Cheap score [0..1], only for info/debug.
+    """
+    edges_count = len(s.get("edges", []))
+    has_pair = (edges_count == 2)
+    center_present = (s.get("center") is not None)
+
+    ang = float(s.get("angle", 0.0))
+    ang_err = _ang_dist(ang, 90.0)
+    angle_score = max(0.0, 1.0 - (ang_err / 45.0))
+
+    score = 0.0
+    score += 0.55 if has_pair else 0.15
+    score += 0.25 if center_present else 0.0
+    score += 0.20 * angle_score
+    return float(max(0.0, min(1.0, score)))
+
+
+# =========================================================
+# ORIGINAL DRAWING FUNCTION (UNCHANGED OUTPUT)
+# =========================================================
 def process_one(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.ndarray):
     edge = cache.filled_to_outline_255(mask255)
     cache.erase_border_inplace(edge, params["border_erase"])
@@ -355,14 +387,48 @@ def process_one(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.
 
     structs = edge_to_structures(edge, params)
 
-    # center red vertical
     cx = w // 2
     cv2.line(vis, (cx, 0), (cx, h - 1), (0, 0, 255), 1, DRAW_LINE_TYPE)
 
-    # sort by closeness to vertical (90deg in your cluster angle space)
     structs = sorted(structs, key=lambda D: _ang_dist(D["angle"], 90.0))
 
-    # draw
+    for idx, D in enumerate(structs):
+        for (x1, y1, x2, y2) in D["edges"]:
+            ext = extend_to_borders(x1, y1, x2, y2, w, h)
+            if ext is None:
+                continue
+            ex1, ey1, ex2, ey2 = ext
+            cv2.line(vis, (ex1, ey1), (ex2, ey2), LANE_EDGE_COLOR, LANE_EDGE_THICKNESS, DRAW_LINE_TYPE)
+
+        if D["center"] is not None:
+            (x1, y1, x2, y2) = D["center"]
+            ext = extend_to_borders(x1, y1, x2, y2, w, h)
+            if ext is None:
+                continue
+            ex1, ey1, ex2, ey2 = ext
+            color = (0, 255, 0) if idx == 0 else (255, 0, 0)
+            cv2.line(vis, (ex1, ey1), (ex2, ey2), color, params["center_thickness"], DRAW_LINE_TYPE)
+
+    return edge, vis
+
+
+# =========================================================
+# CLONE FUNCTION: SAME DRAWING, ALSO RETURNS STRUCTS
+# =========================================================
+def process_one_with_structs(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.ndarray):
+    edge = cache.filled_to_outline_255(mask255)
+    cache.erase_border_inplace(edge, params["border_erase"])
+
+    h, w = edge.shape
+    vis.fill(0)
+
+    structs = edge_to_structures(edge, params)
+
+    cx = w // 2
+    cv2.line(vis, (cx, 0), (cx, h - 1), (0, 0, 255), 1, DRAW_LINE_TYPE)
+
+    structs = sorted(structs, key=lambda D: _ang_dist(D["angle"], 90.0))
+
     for idx, D in enumerate(structs):
         for (x1, y1, x2, y2) in D["edges"]:
             ext = extend_to_borders(x1, y1, x2, y2, w, h)
@@ -388,8 +454,8 @@ class LaneCenterlineNode320x240(Node):
     ONLY WORKS AT 320x240.
 
     Sub:  /camera_bottom/lane_mask        (mono8 0/255)  -> MUST be 320x240
-    Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization
-    Pub:  /camera_bottom/lane_info        (std_msgs/String JSON)
+    Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization (UNCHANGED)
+    Pub:  /camera_bottom/lane_info        (std_msgs/String JSON)  (NEW)
     """
     def __init__(self):
         super().__init__("lane_centerline_node")
@@ -399,10 +465,14 @@ class LaneCenterlineNode320x240(Node):
         self.declare_parameter("info_topic", "/camera_bottom/lane_info")
         self.declare_parameter("skip_n", 0)
 
+        # info publish throttle (keeps fps)
+        self.declare_parameter("info_hz", 5.0)
+
         self.in_topic = str(self.get_parameter("in_topic").value)
         self.out_topic = str(self.get_parameter("out_topic").value)
         self.info_topic = str(self.get_parameter("info_topic").value)
         self.skip_n = int(self.get_parameter("skip_n").value)
+        self.info_hz = float(self.get_parameter("info_hz").value)
 
         self.params = {
             "border_erase": BORDER_ERASE,
@@ -443,10 +513,13 @@ class LaneCenterlineNode320x240(Node):
 
         self._vis = np.zeros((H_TARGET, W_TARGET, 3), np.uint8)
 
-        self.get_logger().info("READY (ONLY 320x240) + lane_info JSON")
+        self._t_last_info = 0.0
+        self._info_period = (1.0 / self.info_hz) if self.info_hz > 0.0 else 0.0
+
+        self.get_logger().info("READY (ONLY 320x240)")
         self.get_logger().info(f"Sub : {self.in_topic}")
         self.get_logger().info(f"Pub : {self.out_topic}")
-        self.get_logger().info(f"Info: {self.info_topic}")
+        self.get_logger().info(f"Info: {self.info_topic} (info_hz={self.info_hz})")
 
     def cb(self, msg: Image):
         self._i += 1
@@ -459,60 +532,64 @@ class LaneCenterlineNode320x240(Node):
             self.get_logger().error(f"cv_bridge failed: {e}")
             return
 
-        # STRICT: must be 320x240
         if mask.shape[0] != H_TARGET or mask.shape[1] != W_TARGET:
             self.get_logger().error(
                 f"Mask must be {W_TARGET}x{H_TARGET}, got {mask.shape[1]}x{mask.shape[0]}"
             )
             return
 
-        _, vis, structs = process_one(mask, self.params, self.cache, self._vis)
+        # SAME drawing, plus structs
+        _, vis, structs = process_one_with_structs(mask, self.params, self.cache, self._vis)
 
-        # publish visualization
-        out_img = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
-        out_img.header = msg.header
-        self.pub_img.publish(out_img)
+        # publish visualization (UNCHANGED)
+        out = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
+        out.header = msg.header
+        self.pub_img.publish(out)
 
-        # ----------------------------
-        # build + publish info JSON
-        # ----------------------------
+        # publish info (throttled)
+        now = time.time()
+        if self._info_period == 0.0 or (now - self._t_last_info) >= self._info_period:
+            self._t_last_info = now
+            self.publish_lane_info(msg, structs)
+
+        # fps log
+        self._count += 1
+        if now - self._t_last >= 2.0:
+            fps = self._count / (now - self._t_last)
+            self.get_logger().info(f"centerline fps ~ {fps:.2f}")
+            self._t_last = now
+            self._count = 0
+
+    def publish_lane_info(self, msg: Image, structs):
         w, h = W_TARGET, H_TARGET
         cx = w // 2
+        y_bottom = h - 1
 
         total_orange_edges = sum(len(s["edges"]) for s in structs)
         num_pairs = sum(1 for s in structs if len(s["edges"]) == 2)
         num_singles = sum(1 for s in structs if len(s["edges"]) == 1)
 
-        info = {
-            "stamp": {
-                "sec": int(msg.header.stamp.sec),
-                "nanosec": int(msg.header.stamp.nanosec),
-            },
-            "img": {"w": w, "h": h, "center_x": cx},
-            "num_structs": int(len(structs)),
-            "total_orange_edges": int(total_orange_edges),
-            "num_pairs": int(num_pairs),
-            "num_single_edges": int(num_singles),
-            "best_struct_index": 0 if len(structs) > 0 else -1,
-            "structs": []
-        }
+        best_idx = 0 if len(structs) > 0 else -1
+        valid = (best_idx >= 0)
 
-        for idx, s in enumerate(structs):
+        best = None
+        if valid:
+            s = structs[0]
             edges_count = int(len(s["edges"]))
             has_pair = (edges_count == 2)
             center_present = (s["center"] is not None)
 
-            st = {
-                "index": int(idx),
-                "angle_deg": float(s["angle"]),   # cluster angle 0..180
+            best = {
+                "index": 0,
+                "angle_deg": float(s["angle"]),
                 "edges_count": edges_count,
                 "has_pair": bool(has_pair),
                 "centerline_present": bool(center_present),
+                "confidence": float(compute_confidence(s)),
             }
 
             if center_present:
                 x1, y1, x2, y2 = s["center"]
-                # use clipped line for stability
                 ext = extend_to_borders(x1, y1, x2, y2, w, h)
                 if ext is not None:
                     x1, y1, x2, y2 = ext
@@ -524,7 +601,90 @@ class LaneCenterlineNode320x240(Node):
                 ang_abs = abs(ang_signed)
 
                 offset_px = float(mid_x - cx)
-                offset_norm = float(offset_px / (w * 0.5 + 1e-9))  # ~[-1,+1]
+                offset_norm = float(offset_px / (w * 0.5 + 1e-9))
+
+                xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
+                if xb is not None:
+                    xb_clamped = float(max(0.0, min(float(w - 1), xb)))
+                    bottom_x_px = xb_clamped
+                    bottom_x_norm = float((bottom_x_px - cx) / (w * 0.5 + 1e-9))
+                else:
+                    bottom_x_px = None
+                    bottom_x_norm = None
+
+                best.update({
+                    "angle_to_red_deg": float(ang_abs),
+                    "angle_to_red_signed_deg": float(ang_signed),
+                    "center_mid": {"x": float(mid_x), "y": float(mid_y)},
+                    "center_offset_x_px": float(offset_px),
+                    "center_offset_x_norm": float(offset_norm),
+                    "bottom_intersect_x_px": bottom_x_px,
+                    "bottom_intersect_x_norm": bottom_x_norm,
+                })
+            else:
+                best.update({
+                    "angle_to_red_deg": None,
+                    "angle_to_red_signed_deg": None,
+                    "center_mid": None,
+                    "center_offset_x_px": None,
+                    "center_offset_x_norm": None,
+                    "bottom_intersect_x_px": None,
+                    "bottom_intersect_x_norm": None,
+                })
+
+        info = {
+            "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
+            "img": {"w": w, "h": h, "center_x": cx, "bottom_y": y_bottom},
+
+            "valid": bool(valid),
+            "num_structs": int(len(structs)),
+            "total_orange_edges": int(total_orange_edges),
+            "num_pairs": int(num_pairs),
+            "num_single_edges": int(num_singles),
+
+            "best": best,
+
+            # keep all structs for debugging
+            "structs": []
+        }
+
+        for idx, s in enumerate(structs):
+            edges_count = int(len(s["edges"]))
+            has_pair = (edges_count == 2)
+            center_present = (s["center"] is not None)
+
+            st = {
+                "index": int(idx),
+                "angle_deg": float(s["angle"]),
+                "edges_count": edges_count,
+                "has_pair": bool(has_pair),
+                "centerline_present": bool(center_present),
+                "confidence": float(compute_confidence(s)),
+            }
+
+            if center_present:
+                x1, y1, x2, y2 = s["center"]
+                ext = extend_to_borders(x1, y1, x2, y2, w, h)
+                if ext is not None:
+                    x1, y1, x2, y2 = ext
+
+                mid_x = 0.5 * (x1 + x2)
+                mid_y = 0.5 * (y1 + y2)
+
+                ang_signed = angle_to_vertical_signed_deg(x1, y1, x2, y2)
+                ang_abs = abs(ang_signed)
+
+                offset_px = float(mid_x - cx)
+                offset_norm = float(offset_px / (w * 0.5 + 1e-9))
+
+                xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
+                if xb is not None:
+                    xb_clamped = float(max(0.0, min(float(w - 1), xb)))
+                    bottom_x_px = xb_clamped
+                    bottom_x_norm = float((bottom_x_px - cx) / (w * 0.5 + 1e-9))
+                else:
+                    bottom_x_px = None
+                    bottom_x_norm = None
 
                 st.update({
                     "angle_to_red_deg": float(ang_abs),
@@ -532,31 +692,25 @@ class LaneCenterlineNode320x240(Node):
                     "center_mid": {"x": float(mid_x), "y": float(mid_y)},
                     "center_offset_x_px": float(offset_px),
                     "center_offset_x_norm": float(offset_norm),
+                    "bottom_intersect_x_px": bottom_x_px,
+                    "bottom_intersect_x_norm": bottom_x_norm,
                 })
             else:
-                # still provide an angle estimate from the strongest edge if you want
                 st.update({
                     "angle_to_red_deg": None,
                     "angle_to_red_signed_deg": None,
                     "center_mid": None,
                     "center_offset_x_px": None,
                     "center_offset_x_norm": None,
+                    "bottom_intersect_x_px": None,
+                    "bottom_intersect_x_norm": None,
                 })
 
             info["structs"].append(st)
 
-        msg_info = String()
-        msg_info.data = json.dumps(info, separators=(",", ":"))
-        self.pub_info.publish(msg_info)
-
-        # fps log
-        self._count += 1
-        now = time.time()
-        if now - self._t_last >= 2.0:
-            fps = self._count / (now - self._t_last)
-            self.get_logger().info(f"centerline fps ~ {fps:.2f}")
-            self._t_last = now
-            self._count = 0
+        m = String()
+        m.data = json.dumps(info, separators=(",", ":"))
+        self.pub_info.publish(m)
 
 
 def main():
