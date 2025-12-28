@@ -40,8 +40,8 @@ class LedConfig:
     mode: int = 0
     speed_ms: int = 60
     brightness: int = 180
-    A: tuple = (255, 0, 0)
-    B: tuple = (0, 0, 255)
+    A: tuple = (255, 255, 255)
+    B: tuple = (255, 255, 255)
 
 
 class NeoPixelUartNode(Node):

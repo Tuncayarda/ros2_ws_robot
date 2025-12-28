@@ -47,6 +47,7 @@ def generate_launch_description():
         parameters=[{
             "camera": 0,
             "role": "viewfinder",
+            "format": "BGR888",
         }],
     )
 
@@ -60,6 +61,9 @@ def generate_launch_description():
         parameters=[{
             "camera": 1,
             "role": "viewfinder",
+            "format": "BGR888",
+            "width": 320,
+            "height": 240,
         }],
     )
 
