@@ -14,7 +14,6 @@ def sanitize_basename(name: str) -> str:
     """
     - Sadece dosya adı (path traversal yok)
     - Güvenli karakterler
-    - Uzantıyı biz ekleyebiliriz (bazı endpointlerde)
     """
     name = Path(name).name.strip()
     safe = "".join(c for c in name if c.isalnum() or c in ("-", "_", ".", " "))
@@ -44,7 +43,6 @@ class MobileComNode(Node):
         self.declare_parameter("sounds_dir", str(Path.home() / "Sounds"))
         self.declare_parameter("max_upload_mb", 50)
 
-        # ✅ NEW: emojis dir + limits
         self.declare_parameter("emojis_dir", str(Path.home() / "Emojis"))
         self.declare_parameter("max_emoji_upload_mb", 80)
 
@@ -63,14 +61,25 @@ class MobileComNode(Node):
         self.get_logger().info(f"Sounds dir: {self.sounds_dir} (max {self.max_upload_bytes/1024/1024:.1f} MB)")
         self.get_logger().info(f"Emojis dir: {self.emojis_dir} (max {self.max_emoji_upload_bytes/1024/1024:.1f} MB)")
 
+        # -------------------- FILE TYPES --------------------
+        self.allowed_image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        self.allowed_video_exts = {".mp4", ".mov", ".webm"}
+        self.allowed_emoji_exts = self.allowed_image_exts | self.allowed_video_exts
+
         # -------------------- ROS TOPICS --------------------
-        # Sounds request/response
+        # list topics
         self.sounds_list_req_topic = "/mobile/sounds/list_req"
         self.sounds_list_res_topic = "/mobile/sounds/list_res"
 
-        # ✅ NEW: Emojis request/response
         self.emojis_list_req_topic = "/mobile/emojis/list_req"
         self.emojis_list_res_topic = "/mobile/emojis/list_res"
+
+        # delete topics
+        self.sounds_delete_req_topic = "/mobile/sounds/delete_req"
+        self.sounds_delete_res_topic = "/mobile/sounds/delete_res"
+
+        self.emojis_delete_req_topic = "/mobile/emojis/delete_req"
+        self.emojis_delete_res_topic = "/mobile/emojis/delete_res"
 
         # ROS pubs/subs
         self.pub_sounds_list_res = self.create_publisher(String, self.sounds_list_res_topic, 10)
@@ -78,6 +87,12 @@ class MobileComNode(Node):
 
         self.pub_emojis_list_res = self.create_publisher(String, self.emojis_list_res_topic, 10)
         self.sub_emojis_list_req = self.create_subscription(String, self.emojis_list_req_topic, self.on_emojis_list_req, 10)
+
+        self.pub_sounds_delete_res = self.create_publisher(String, self.sounds_delete_res_topic, 10)
+        self.sub_sounds_delete_req = self.create_subscription(String, self.sounds_delete_req_topic, self.on_sounds_delete_req, 10)
+
+        self.pub_emojis_delete_res = self.create_publisher(String, self.emojis_delete_res_topic, 10)
+        self.sub_emojis_delete_req = self.create_subscription(String, self.emojis_delete_req_topic, self.on_emojis_delete_req, 10)
 
         # -------------------- FASTAPI --------------------
         app = FastAPI()
@@ -131,27 +146,17 @@ class MobileComNode(Node):
 
             self.get_logger().info(f"Saved mp3: {out_path} ({written/1024/1024:.2f} MB)")
 
-            # yeni ses -> listeyi broadcast
+            # ✅ yeni ses -> listeyi broadcast
             self.broadcast_sounds_list()
 
             return {"ok": True, "filename": base, "size_mb": round(written / 1024 / 1024, 2)}
 
         # ==================== EMOJIS (PHOTO/VIDEO) ====================
-        # Kabul edilen uzantılar
-        self.allowed_image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-        self.allowed_video_exts = {".mp4", ".mov", ".webm"}
-        self.allowed_emoji_exts = self.allowed_image_exts | self.allowed_video_exts
-
         @app.post("/upload_emoji")
         async def upload_emoji(
             file: UploadFile = File(...),
             name: str = Form(...),
         ):
-            """
-            Mobil şunları yollar:
-            - file: (jpg/png/webp/gif/mp4/mov/webm)
-            - name: kaydedilecek isim (uzantı otomatik file.filename'dan alınır)
-            """
             if not file:
                 raise HTTPException(status_code=400, detail="missing file")
 
@@ -170,7 +175,6 @@ class MobileComNode(Node):
                     detail=f"invalid file type. allowed: {sorted(self.allowed_emoji_exts)}"
                 )
 
-            # base'in içinde uzantı verilmişse ve farklıysa, base'in uzantısını yok sayıp ext'i kullan
             base_no_ext = base
             if Path(base).suffix:
                 base_no_ext = Path(base).stem
@@ -260,7 +264,6 @@ class MobileComNode(Node):
                 })
             except Exception:
                 continue
-
         return {"ok": True, "count": len(items), "items": items}
 
     def broadcast_emojis_list(self):
@@ -278,6 +281,69 @@ class MobileComNode(Node):
 
     def on_emojis_list_req(self, _msg: String):
         self.broadcast_emojis_list()
+
+    # -------------------- DELETE: SOUNDS --------------------
+    def on_sounds_delete_req(self, msg: String):
+        """
+        msg.data JSON string:
+          {"name":"file.mp3"}
+        """
+        try:
+            data = json.loads(msg.data)
+            name = sanitize_basename(data.get("name", ""))
+
+            if not name.lower().endswith(".mp3"):
+                raise ValueError("sound must be .mp3")
+
+            path = self.sounds_dir / name
+            if not path.exists():
+                raise FileNotFoundError("file not found")
+
+            path.unlink()
+            self.get_logger().info(f"Deleted sound: {name}")
+
+            # ✅ Silince yeni listeyi broadcast et
+            self.broadcast_sounds_list()
+
+            res = {"ok": True, "name": name}
+        except Exception as e:
+            res = {"ok": False, "error": str(e)}
+
+        out = String()
+        out.data = json.dumps(res, ensure_ascii=False)
+        self.pub_sounds_delete_res.publish(out)
+
+    # -------------------- DELETE: EMOJIS --------------------
+    def on_emojis_delete_req(self, msg: String):
+        """
+        msg.data JSON string:
+          {"name":"happy.png"}  (uzantı şart)
+        """
+        try:
+            data = json.loads(msg.data)
+            name = sanitize_basename(data.get("name", ""))
+
+            ext = normalize_ext(Path(name).suffix)
+            if ext not in self.allowed_emoji_exts:
+                raise ValueError(f"invalid emoji ext: {ext}")
+
+            path = self.emojis_dir / name
+            if not path.exists():
+                raise FileNotFoundError("file not found")
+
+            path.unlink()
+            self.get_logger().info(f"Deleted emoji: {name}")
+
+            # ✅ Silince yeni listeyi broadcast et
+            self.broadcast_emojis_list()
+
+            res = {"ok": True, "name": name}
+        except Exception as e:
+            res = {"ok": False, "error": str(e)}
+
+        out = String()
+        out.data = json.dumps(res, ensure_ascii=False)
+        self.pub_emojis_delete_res.publish(out)
 
     # -------------------- HTTP server --------------------
     def run_http(self):

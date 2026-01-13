@@ -295,14 +295,12 @@ def main():
 
     atexit.register(_final_cleanup)
 
-    # ✅ launch SIGINT/SIGTERM gönderince hızlı çık (launch SIGTERM'e yükseltmesin)
     def _handle_signal(_signum, _frame):
         _final_cleanup()
         try:
             node.destroy_node()
         except Exception:
             pass
-        # direkt çık: garantili
         os._exit(0)
 
     signal.signal(signal.SIGINT, _handle_signal)
