@@ -16,7 +16,6 @@ H_TARGET = 240
 
 OUTLINE_K = 5
 EDGE_THICKNESS = 2
-
 BORDER_ERASE = 3
 
 HOUGH_THRESH = 22
@@ -38,12 +37,18 @@ CENTER_THICKNESS = 2
 
 LANE_EDGE_COLOR = (0, 140, 255)     # BGR orange
 LANE_EDGE_THICKNESS = 2
-DRAW_LINE_TYPE = cv2.LINE_8         # CPU friendly
+DRAW_LINE_TYPE = cv2.LINE_8
+
+COLOR_LANE1 = (0, 255, 0)   # green
+COLOR_LANE2 = (255, 0, 0)   # blue
 
 
 # =========================================================
 # LINE UTILS
 # =========================================================
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
 def extend_to_borders(x1, y1, x2, y2, w, h, scale=10000):
     dx = x2 - x1
     dy = y2 - y1
@@ -58,18 +63,39 @@ def extend_to_borders(x1, y1, x2, y2, w, h, scale=10000):
         return None
     return (p1[0], p1[1], p2[0], p2[1])
 
-
 def _angle_deg(x1, y1, x2, y2):
     ang = np.degrees(np.arctan2((y2 - y1), (x2 - x1)))
     ang = (ang + 180.0) % 180.0
     return float(ang)
 
-
 def _ang_dist(a, b):
     d = abs(a - b)
     return min(d, 180.0 - d)
 
+def angle_to_vertical_signed_deg(x1, y1, x2, y2) -> float:
+    # signed relative to vertical axis (image y axis)
+    dx = float(x2 - x1)
+    dy = float(y2 - y1)
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return 0.0
+    ang = np.degrees(np.arctan2(dx, dy))  # note: dx,dy swapped -> vertical reference
+    if ang > 90.0:
+        ang -= 180.0
+    if ang < -90.0:
+        ang += 180.0
+    return float(ang)
 
+def line_x_at_y(x1, y1, x2, y2, y_query):
+    y1f, y2f = float(y1), float(y2)
+    if abs(y2f - y1f) < 1e-6:
+        return None
+    t = (float(y_query) - y1f) / (y2f - y1f)
+    return float(x1) + t * float(x2 - x1)
+
+
+# =========================================================
+# CLUSTERING / STRUCTS
+# =========================================================
 def _cluster_by_angle(lines, tol_deg):
     clusters = []
 
@@ -103,11 +129,9 @@ def _cluster_by_angle(lines, tol_deg):
     clusters.sort(key=lambda z: z["score"], reverse=True)
     return clusters
 
-
 def _t_range_of_points(pts_xy, ux, uy):
     t = pts_xy[:, 0] * ux + pts_xy[:, 1] * uy
     return float(t.min()), float(t.max())
-
 
 def _line_from_u_c(ux, uy, nx, ny, c_val, tmin, tmax, w, h):
     xA = ux * tmin + nx * c_val
@@ -122,7 +146,6 @@ def _line_from_u_c(ux, uy, nx, ny, c_val, tmin, tmax, w, h):
     if not ok:
         return None
     return (p1[0], p1[1], p2[0], p2[1])
-
 
 def _centerline_and_edges_from_cluster(
     cluster, w, h,
@@ -243,10 +266,8 @@ def _centerline_and_edges_from_cluster(
 
     return {"angle": float(cluster["mean"]), "center": center_line, "edges": edge_lines}
 
-
 def edge_to_structures(edge255: np.ndarray, params: dict):
     h, w = edge255.shape
-
     linesP = cv2.HoughLinesP(
         edge255, 1, np.pi / 180.0, params["hough_thresh"],
         minLineLength=params["hough_min_len"], maxLineGap=params["hough_max_gap"]
@@ -280,6 +301,7 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
         if st is None:
             continue
 
+        # avoid near-duplicate directions
         ok = True
         for ex in structs:
             if _ang_dist(st["angle"], ex["angle"]) < 18.0:
@@ -287,7 +309,6 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
                 break
         if ok:
             structs.append(st)
-
         if len(structs) >= params["max_centerlines"]:
             break
 
@@ -295,7 +316,7 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
 
 
 # =========================
-# OPTIMIZED PREPROCESS
+# PREPROCESS
 # =========================
 class PreprocCache:
     def __init__(self, outline_k: int, edge_thickness: int):
@@ -325,41 +346,9 @@ class PreprocCache:
 
 
 # =========================================================
-# INFO METRICS (READ-ONLY; DOES NOT AFFECT DRAWING)
+# METRICS / FEATURE
 # =========================================================
-def angle_to_vertical_signed_deg(x1, y1, x2, y2) -> float:
-    """
-    0 deg = vertical (red line).
-    + => leaning right, - => leaning left.
-    """
-    dx = float(x2 - x1)
-    dy = float(y2 - y1)
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-        return 0.0
-    ang = np.degrees(np.arctan2(dx, dy))  # relative to vertical axis
-    if ang > 90.0:
-        ang -= 180.0
-    if ang < -90.0:
-        ang += 180.0
-    return float(ang)
-
-
-def line_x_at_y(x1, y1, x2, y2, y_query):
-    """
-    x position where infinite line through (x1,y1)-(x2,y2) crosses y=y_query.
-    Returns None if horizontal.
-    """
-    y1f, y2f = float(y1), float(y2)
-    if abs(y2f - y1f) < 1e-6:
-        return None
-    t = (float(y_query) - y1f) / (y2f - y1f)
-    return float(x1) + t * float(x2 - x1)
-
-
 def compute_confidence(s: dict) -> float:
-    """
-    Cheap score [0..1], only for info/debug.
-    """
     edges_count = len(s.get("edges", []))
     has_pair = (edges_count == 2)
     center_present = (s.get("center") is not None)
@@ -374,88 +363,105 @@ def compute_confidence(s: dict) -> float:
     score += 0.20 * angle_score
     return float(max(0.0, min(1.0, score)))
 
+def lane_feat_from_struct(s, w, h):
+    """
+    Her şey: açı, bottom intersect, mid offset, px ve norm offsetler
+    """
+    cx = w // 2
+    y_bottom = h - 1
+    y_mid = h // 2
+
+    conf = float(compute_confidence(s))
+    edges_count = int(len(s.get("edges", [])))
+    has_pair = bool(edges_count == 2)
+
+    center = s.get("center", None)
+    if center is None:
+        return None
+
+    x1, y1, x2, y2 = center
+    ext = extend_to_borders(x1, y1, x2, y2, w, h)
+    if ext is not None:
+        x1, y1, x2, y2 = ext
+
+    ang_deg = float(s.get("angle", 0.0))
+    ang_to_vert_signed = float(angle_to_vertical_signed_deg(x1, y1, x2, y2))
+
+    xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
+    xm = line_x_at_y(x1, y1, x2, y2, y_mid)
+    if xb is None or xm is None:
+        return None
+
+    xb = float(clamp(xb, 0.0, float(w - 1)))
+    xm = float(clamp(xm, 0.0, float(w - 1)))
+
+    bottom_dx_px = xb - float(cx)
+    mid_dx_px = xm - float(cx)
+
+    bottom_dx_norm = float(bottom_dx_px / (w * 0.5 + 1e-9))
+    mid_dx_norm = float(mid_dx_px / (w * 0.5 + 1e-9))
+
+    # also include center segment midpoint offset
+    mid_x_seg = 0.5 * (x1 + x2)
+    center_offset_px = float(mid_x_seg - cx)
+    center_offset_norm = float(center_offset_px / (w * 0.5 + 1e-9))
+
+    return {
+        "confidence": conf,
+        "has_pair": has_pair,
+        "edges_count": edges_count,
+
+        "angle_deg": ang_deg,
+        "angle_to_red_signed_deg": ang_to_vert_signed,  # same name you used
+
+        "bottom_intersect_x_px": xb,
+        "bottom_intersect_dx_px": bottom_dx_px,
+        "bottom_intersect_x_norm": bottom_dx_norm,
+
+        "mid_intersect_x_px": xm,
+        "mid_intersect_dx_px": mid_dx_px,
+        "mid_intersect_x_norm": mid_dx_norm,
+
+        "center_offset_x_px": center_offset_px,
+        "center_offset_x_norm": center_offset_norm,
+
+        "center": (int(x1), int(y1), int(x2), int(y2)),
+        "angle_to_vertical_abs_err": float(_ang_dist(ang_deg, 90.0)),
+    }
+
 
 # =========================================================
-# ORIGINAL DRAWING FUNCTION (UNCHANGED OUTPUT)
+# MAIN PROCESS
 # =========================================================
 def process_one(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.ndarray):
     edge = cache.filled_to_outline_255(mask255)
     cache.erase_border_inplace(edge, params["border_erase"])
+    structs = edge_to_structures(edge, params)
 
     h, w = edge.shape
     vis.fill(0)
 
-    structs = edge_to_structures(edge, params)
-
+    # red center line
     cx = w // 2
     cv2.line(vis, (cx, 0), (cx, h - 1), (0, 0, 255), 1, DRAW_LINE_TYPE)
 
-    structs = sorted(structs, key=lambda D: _ang_dist(D["angle"], 90.0))
-
-    for idx, D in enumerate(structs):
+    # draw edges first
+    for D in structs:
         for (x1, y1, x2, y2) in D["edges"]:
             ext = extend_to_borders(x1, y1, x2, y2, w, h)
             if ext is None:
                 continue
             ex1, ey1, ex2, ey2 = ext
             cv2.line(vis, (ex1, ey1), (ex2, ey2), LANE_EDGE_COLOR, LANE_EDGE_THICKNESS, DRAW_LINE_TYPE)
-
-        if D["center"] is not None:
-            (x1, y1, x2, y2) = D["center"]
-            ext = extend_to_borders(x1, y1, x2, y2, w, h)
-            if ext is None:
-                continue
-            ex1, ey1, ex2, ey2 = ext
-            color = (0, 255, 0) if idx == 0 else (255, 0, 0)
-            cv2.line(vis, (ex1, ey1), (ex2, ey2), color, params["center_thickness"], DRAW_LINE_TYPE)
-
-    return edge, vis
-
-
-# =========================================================
-# CLONE FUNCTION: SAME DRAWING, ALSO RETURNS STRUCTS
-# =========================================================
-def process_one_with_structs(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.ndarray):
-    edge = cache.filled_to_outline_255(mask255)
-    cache.erase_border_inplace(edge, params["border_erase"])
-
-    h, w = edge.shape
-    vis.fill(0)
-
-    structs = edge_to_structures(edge, params)
-
-    cx = w // 2
-    cv2.line(vis, (cx, 0), (cx, h - 1), (0, 0, 255), 1, DRAW_LINE_TYPE)
-
-    structs = sorted(structs, key=lambda D: _ang_dist(D["angle"], 90.0))
-
-    for idx, D in enumerate(structs):
-        for (x1, y1, x2, y2) in D["edges"]:
-            ext = extend_to_borders(x1, y1, x2, y2, w, h)
-            if ext is None:
-                continue
-            ex1, ey1, ex2, ey2 = ext
-            cv2.line(vis, (ex1, ey1), (ex2, ey2), LANE_EDGE_COLOR, LANE_EDGE_THICKNESS, DRAW_LINE_TYPE)
-
-        if D["center"] is not None:
-            (x1, y1, x2, y2) = D["center"]
-            ext = extend_to_borders(x1, y1, x2, y2, w, h)
-            if ext is None:
-                continue
-            ex1, ey1, ex2, ey2 = ext
-            color = (0, 255, 0) if idx == 0 else (255, 0, 0)
-            cv2.line(vis, (ex1, ey1), (ex2, ey2), color, params["center_thickness"], DRAW_LINE_TYPE)
 
     return edge, vis, structs
 
 
 class LaneCenterlineNode320x240(Node):
     """
-    ONLY WORKS AT 320x240.
-
-    Sub:  /camera_bottom/lane_mask        (mono8 0/255)  -> MUST be 320x240
-    Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization (UNCHANGED)
-    Pub:  /camera_bottom/lane_info        (std_msgs/String JSON)  (NEW)
+    Sub:  /camera_bottom/lane_mask        (mono8 0/255)  -> 320x240
+    Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization
+    Pub:  /camera_bottom/lane_info        (String JSON)  -> HER FRAME (FAST)
     """
     def __init__(self):
         super().__init__("lane_centerline_node")
@@ -465,14 +471,10 @@ class LaneCenterlineNode320x240(Node):
         self.declare_parameter("info_topic", "/camera_bottom/lane_info")
         self.declare_parameter("skip_n", 0)
 
-        # info publish throttle (keeps fps)
-        self.declare_parameter("info_hz", 5.0)
-
         self.in_topic = str(self.get_parameter("in_topic").value)
         self.out_topic = str(self.get_parameter("out_topic").value)
         self.info_topic = str(self.get_parameter("info_topic").value)
         self.skip_n = int(self.get_parameter("skip_n").value)
-        self.info_hz = float(self.get_parameter("info_hz").value)
 
         self.params = {
             "border_erase": BORDER_ERASE,
@@ -496,30 +498,32 @@ class LaneCenterlineNode320x240(Node):
 
         self.cache = PreprocCache(OUTLINE_K, EDGE_THICKNESS)
         self.bridge = CvBridge()
+        self._vis = np.zeros((H_TARGET, W_TARGET, 3), np.uint8)
 
-        qos = QoSProfile(
+        # QoS: lowest latency
+        qos_in = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        qos_out = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
-        self.sub = self.create_subscription(Image, self.in_topic, self.cb, qos)
-        self.pub_img = self.create_publisher(Image, self.out_topic, 1)
-        self.pub_info = self.create_publisher(String, self.info_topic, 1)
+        self.sub = self.create_subscription(Image, self.in_topic, self.cb, qos_in)
+        self.pub_img = self.create_publisher(Image, self.out_topic, qos_out)
+        self.pub_info = self.create_publisher(String, self.info_topic, qos_out)
 
         self._i = 0
-        self._t_last = time.time()
-        self._count = 0
+        self._t_fps = time.time()
+        self._n_fps = 0
 
-        self._vis = np.zeros((H_TARGET, W_TARGET, 3), np.uint8)
-
-        self._t_last_info = 0.0
-        self._info_period = (1.0 / self.info_hz) if self.info_hz > 0.0 else 0.0
-
-        self.get_logger().info("READY (ONLY 320x240)")
+        self.get_logger().info("READY lane_centerline_node (FAST publish every frame)")
         self.get_logger().info(f"Sub : {self.in_topic}")
         self.get_logger().info(f"Pub : {self.out_topic}")
-        self.get_logger().info(f"Info: {self.info_topic} (info_hz={self.info_hz})")
+        self.get_logger().info(f"Info: {self.info_topic}")
 
     def cb(self, msg: Image):
         self._i += 1
@@ -533,184 +537,112 @@ class LaneCenterlineNode320x240(Node):
             return
 
         if mask.shape[0] != H_TARGET or mask.shape[1] != W_TARGET:
-            self.get_logger().error(
-                f"Mask must be {W_TARGET}x{H_TARGET}, got {mask.shape[1]}x{mask.shape[0]}"
-            )
+            self.get_logger().error(f"Mask must be {W_TARGET}x{H_TARGET}, got {mask.shape[1]}x{mask.shape[0]}")
             return
 
-        # SAME drawing, plus structs
-        _, vis, structs = process_one_with_structs(mask, self.params, self.cache, self._vis)
+        _, vis, structs = process_one(mask, self.params, self.cache, self._vis)
 
-        # publish visualization (UNCHANGED)
-        out = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
-        out.header = msg.header
-        self.pub_img.publish(out)
+        # ---- build feats (only those with centerline)
+        dets = []
+        for s in structs:
+            feat = lane_feat_from_struct(s, W_TARGET, H_TARGET)
+            if feat is None:
+                continue
+            dets.append(feat)
 
-        # publish info (throttled)
-        now = time.time()
-        if self._info_period == 0.0 or (now - self._t_last_info) >= self._info_period:
-            self._t_last_info = now
-            self.publish_lane_info(msg, structs)
+        # ---- sort by angle closeness to vertical (90deg) -> lane1 green
+        dets_sorted = sorted(dets, key=lambda d: d["angle_to_vertical_abs_err"])
+        lane1 = dets_sorted[0] if len(dets_sorted) >= 1 else None
+        lane2 = dets_sorted[1] if len(dets_sorted) >= 2 else None
 
-        # fps log
-        self._count += 1
-        if now - self._t_last >= 2.0:
-            fps = self._count / (now - self._t_last)
-            self.get_logger().info(f"centerline fps ~ {fps:.2f}")
-            self._t_last = now
-            self._count = 0
+        # ---- draw lane1 (green) + lane2 (blue)
+        def draw_center(feat, color):
+            if feat is None:
+                return
+            x1, y1, x2, y2 = feat["center"]
+            ext = extend_to_borders(x1, y1, x2, y2, W_TARGET, H_TARGET)
+            if ext is None:
+                return
+            ex1, ey1, ex2, ey2 = ext
+            cv2.line(vis, (ex1, ey1), (ex2, ey2), color, self.params["center_thickness"], DRAW_LINE_TYPE)
 
-    def publish_lane_info(self, msg: Image, structs):
-        w, h = W_TARGET, H_TARGET
-        cx = w // 2
-        y_bottom = h - 1
+        draw_center(lane1, COLOR_LANE1)
+        draw_center(lane2, COLOR_LANE2)
 
-        total_orange_edges = sum(len(s["edges"]) for s in structs)
-        num_pairs = sum(1 for s in structs if len(s["edges"]) == 2)
-        num_singles = sum(1 for s in structs if len(s["edges"]) == 1)
+        # ---- publish vis
+        out_img = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
+        out_img.header = msg.header
+        self.pub_img.publish(out_img)
 
-        best_idx = 0 if len(structs) > 0 else -1
-        valid = (best_idx >= 0)
-
-        best = None
-        if valid:
-            s = structs[0]
-            edges_count = int(len(s["edges"]))
-            has_pair = (edges_count == 2)
-            center_present = (s["center"] is not None)
-
-            best = {
-                "index": 0,
-                "angle_deg": float(s["angle"]),
-                "edges_count": edges_count,
-                "has_pair": bool(has_pair),
-                "centerline_present": bool(center_present),
-                "confidence": float(compute_confidence(s)),
-            }
-
-            if center_present:
-                x1, y1, x2, y2 = s["center"]
-                ext = extend_to_borders(x1, y1, x2, y2, w, h)
-                if ext is not None:
-                    x1, y1, x2, y2 = ext
-
-                mid_x = 0.5 * (x1 + x2)
-                mid_y = 0.5 * (y1 + y2)
-
-                ang_signed = angle_to_vertical_signed_deg(x1, y1, x2, y2)
-                ang_abs = abs(ang_signed)
-
-                offset_px = float(mid_x - cx)
-                offset_norm = float(offset_px / (w * 0.5 + 1e-9))
-
-                xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
-                if xb is not None:
-                    xb_clamped = float(max(0.0, min(float(w - 1), xb)))
-                    bottom_x_px = xb_clamped
-                    bottom_x_norm = float((bottom_x_px - cx) / (w * 0.5 + 1e-9))
-                else:
-                    bottom_x_px = None
-                    bottom_x_norm = None
-
-                best.update({
-                    "angle_to_red_deg": float(ang_abs),
-                    "angle_to_red_signed_deg": float(ang_signed),
-                    "center_mid": {"x": float(mid_x), "y": float(mid_y)},
-                    "center_offset_x_px": float(offset_px),
-                    "center_offset_x_norm": float(offset_norm),
-                    "bottom_intersect_x_px": bottom_x_px,
-                    "bottom_intersect_x_norm": bottom_x_norm,
-                })
-            else:
-                best.update({
-                    "angle_to_red_deg": None,
-                    "angle_to_red_signed_deg": None,
-                    "center_mid": None,
-                    "center_offset_x_px": None,
-                    "center_offset_x_norm": None,
-                    "bottom_intersect_x_px": None,
-                    "bottom_intersect_x_norm": None,
-                })
-
+        # ---- publish info (every frame)
+        cx = W_TARGET // 2
         info = {
             "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
-            "img": {"w": w, "h": h, "center_x": cx, "bottom_y": y_bottom},
+            "img": {"w": W_TARGET, "h": H_TARGET, "center_x": cx, "bottom_y": H_TARGET - 1, "mid_y": H_TARGET // 2},
 
-            "valid": bool(valid),
-            "num_structs": int(len(structs)),
-            "total_orange_edges": int(total_orange_edges),
-            "num_pairs": int(num_pairs),
-            "num_single_edges": int(num_singles),
+            "lane_count_detected": int(len(dets_sorted)),
+            "valid_lane1": bool(lane1 is not None),
+            "valid_lane2": bool(lane2 is not None),
 
-            "best": best,
+            "lane1": None,
+            "lane2": None,
 
-            # keep all structs for debugging
-            "structs": []
+            # debug: all detections this frame
+            "lanes_detected": [],
         }
 
-        for idx, s in enumerate(structs):
-            edges_count = int(len(s["edges"]))
-            has_pair = (edges_count == 2)
-            center_present = (s["center"] is not None)
+        def pack_lane(feat, lane_id: int):
+            if feat is None:
+                return None
+            return {
+                "id": lane_id,
+                "confidence": float(feat["confidence"]),
+                "has_pair": bool(feat["has_pair"]),
+                "edges_count": int(feat["edges_count"]),
 
-            st = {
-                "index": int(idx),
-                "angle_deg": float(s["angle"]),
-                "edges_count": edges_count,
-                "has_pair": bool(has_pair),
-                "centerline_present": bool(center_present),
-                "confidence": float(compute_confidence(s)),
+                "angle_deg": float(feat["angle_deg"]),
+                "angle_to_red_signed_deg": float(feat["angle_to_red_signed_deg"]),
+
+                "bottom_intersect_x_norm": float(feat["bottom_intersect_x_norm"]),
+                "mid_intersect_x_norm": float(feat["mid_intersect_x_norm"]),
+                "center_offset_x_norm": float(feat["center_offset_x_norm"]),
+
+                "bottom_intersect_dx_px": float(feat["bottom_intersect_dx_px"]),
+                "mid_intersect_dx_px": float(feat["mid_intersect_dx_px"]),
+                "center_offset_x_px": float(feat["center_offset_x_px"]),
             }
 
-            if center_present:
-                x1, y1, x2, y2 = s["center"]
-                ext = extend_to_borders(x1, y1, x2, y2, w, h)
-                if ext is not None:
-                    x1, y1, x2, y2 = ext
+        info["lane1"] = pack_lane(lane1, 1)
+        info["lane2"] = pack_lane(lane2, 2)
 
-                mid_x = 0.5 * (x1 + x2)
-                mid_y = 0.5 * (y1 + y2)
-
-                ang_signed = angle_to_vertical_signed_deg(x1, y1, x2, y2)
-                ang_abs = abs(ang_signed)
-
-                offset_px = float(mid_x - cx)
-                offset_norm = float(offset_px / (w * 0.5 + 1e-9))
-
-                xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
-                if xb is not None:
-                    xb_clamped = float(max(0.0, min(float(w - 1), xb)))
-                    bottom_x_px = xb_clamped
-                    bottom_x_norm = float((bottom_x_px - cx) / (w * 0.5 + 1e-9))
-                else:
-                    bottom_x_px = None
-                    bottom_x_norm = None
-
-                st.update({
-                    "angle_to_red_deg": float(ang_abs),
-                    "angle_to_red_signed_deg": float(ang_signed),
-                    "center_mid": {"x": float(mid_x), "y": float(mid_y)},
-                    "center_offset_x_px": float(offset_px),
-                    "center_offset_x_norm": float(offset_norm),
-                    "bottom_intersect_x_px": bottom_x_px,
-                    "bottom_intersect_x_norm": bottom_x_norm,
-                })
-            else:
-                st.update({
-                    "angle_to_red_deg": None,
-                    "angle_to_red_signed_deg": None,
-                    "center_mid": None,
-                    "center_offset_x_px": None,
-                    "center_offset_x_norm": None,
-                    "bottom_intersect_x_px": None,
-                    "bottom_intersect_x_norm": None,
-                })
-
-            info["structs"].append(st)
+        for d in dets_sorted:
+            info["lanes_detected"].append({
+                "confidence": float(d["confidence"]),
+                "has_pair": bool(d["has_pair"]),
+                "edges_count": int(d["edges_count"]),
+                "angle_deg": float(d["angle_deg"]),
+                "angle_to_red_signed_deg": float(d["angle_to_red_signed_deg"]),
+                "bottom_intersect_x_norm": float(d["bottom_intersect_x_norm"]),
+                "mid_intersect_x_norm": float(d["mid_intersect_x_norm"]),
+                "center_offset_x_norm": float(d["center_offset_x_norm"]),
+                "bottom_intersect_dx_px": float(d["bottom_intersect_dx_px"]),
+                "mid_intersect_dx_px": float(d["mid_intersect_dx_px"]),
+                "center_offset_x_px": float(d["center_offset_x_px"]),
+                "angle_to_vertical_abs_err": float(d["angle_to_vertical_abs_err"]),
+            })
 
         m = String()
         m.data = json.dumps(info, separators=(",", ":"))
         self.pub_info.publish(m)
+
+        # fps log
+        self._n_fps += 1
+        now = time.time()
+        if now - self._t_fps >= 2.0:
+            fps = self._n_fps / (now - self._t_fps)
+            self.get_logger().info(f"lane_centerline_node fps ~ {fps:.2f} (publishing info every frame)")
+            self._t_fps = now
+            self._n_fps = 0
 
 
 def main():
