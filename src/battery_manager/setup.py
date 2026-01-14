@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'neopixel_uart'
+package_name = 'battery_manager'
 
 setup(
     name=package_name,
@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'neopixel_uart_node = neopixel_uart.neopixel_uart_node:main',
+            'battery_manager_node = battery_manager.battery_manager_node:main',
         ],
     },
 )

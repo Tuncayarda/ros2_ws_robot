@@ -30,6 +30,7 @@ setup(
             'camera_sampler = debug.camera_sampler_node:main',
             'lane_mask_jpegpipe_oneshot = debug.frame_test:main',
             'imu_arrow_teleop = debug.imu_control_node:main',
+            'imu_pid_motion = debug.imu_pid_motion_node:main',
         ],
     },
 )

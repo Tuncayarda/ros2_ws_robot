@@ -1,405 +1,405 @@
 #!/usr/bin/env python3
-import time
 import math
-import threading
-from typing import Optional
+import time
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from std_msgs.msg import Int16MultiArray
+from std_msgs.msg import String, Int16MultiArray
 from sensor_msgs.msg import Imu
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
-def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
-    # yaw in radians [-pi, +pi]
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
 
-def rad2deg(r: float) -> float:
-    return r * 180.0 / math.pi
-
-def wrap_deg(a: float) -> float:
-    # [-180, 180)
-    while a >= 180.0:
-        a -= 360.0
-    while a < -180.0:
-        a += 360.0
+def wrap_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
     return a
 
 
-class ImuTurnPidTeleop(Node):
-    """
-    UP hold: forward
-    LEFT/RIGHT: target = yaw_corr +/- turn_step_deg, PID ile hedefe kilitlen
-    SPACE: stop
-    Q/ESC: quit
+def rad2deg(x: float) -> float:
+    return x * 180.0 / math.pi
 
-    Tek knoblar:
-      - yaw_sign: IMU yaw tersse -1 yap
-      - turn_motor_sign: motor dönüş yönü tersse -1 yap
-    """
 
+def deg2rad(x: float) -> float:
+    return x * math.pi / 180.0
+
+
+def parse_cmd(s: str) -> Tuple[str, Optional[float]]:
+    """
+    Accepts:
+      - "stop"
+      - "forward 2"      (seconds)
+      - "right 25"       (degrees)
+      - "left 25"        (degrees)
+    """
+    s = (s or "").strip().lower()
+    if not s:
+        return ("", None)
+
+    parts = s.split()
+    if parts[0] == "stop":
+        return ("stop", None)
+
+    if parts[0] in ("forward", "left", "right"):
+        if len(parts) < 2:
+            return (parts[0], None)
+        try:
+            val = float(parts[1])
+        except Exception:
+            return (parts[0], None)
+        return (parts[0], val)
+
+    return ("", None)
+
+
+@dataclass
+class ImuState:
+    t: float
+    yaw: float     # integrated yaw (rad)
+    wz: float      # yaw rate (rad/s)
+
+
+class ImuOnlyMotionNode(Node):
     def __init__(self):
-        super().__init__("imu_turn_pid_teleop")
+        super().__init__("imu_only_motion_node")
 
-        # topics
+        # Topics
         self.declare_parameter("imu_topic", "/imu")
-        self.declare_parameter("motor_topic", "/motor_cmd")
+        self.declare_parameter("cmd_topic", "/imu_motion/cmd")
+        self.declare_parameter("motor_cmd_topic", "/motor_cmd")
+        self.declare_parameter("debug_topic", "/imu_motion/debug")
 
-        # rates
-        self.declare_parameter("control_hz", 80.0)
-        self.declare_parameter("imu_timeout_s", 0.35)
+        # IMU sign
+        self.declare_parameter("wz_sign", 1.0)
 
-        # forward
-        self.declare_parameter("fwd_pwm", 220.0)
-        self.declare_parameter("slew_per_tick", 80)
+        # Freshness
+        self.declare_parameter("imu_stale_s", 0.50)
 
-        # turn
-        self.declare_parameter("turn_step_deg", 90.0)
-        self.declare_parameter("turn_tol_deg", 1.0)
-        self.declare_parameter("settle_s", 0.20)
+        # Motor limits + slew
+        self.declare_parameter("motor_limit", 1000.0)
+        self.declare_parameter("slew_per_sec", 450.0)
 
-        # PID (error in degrees)
-        self.declare_parameter("kp", 7.0)
-        self.declare_parameter("ki", 0.25)
-        self.declare_parameter("kd", 1.3)
-        self.declare_parameter("i_clamp_pwm", 220.0)
+        # Forward (heading hold)
+        self.declare_parameter("fwd_speed", 180.0)
+        self.declare_parameter("fwd_kp", 260.0)
+        self.declare_parameter("fwd_kd", 60.0)
+        self.declare_parameter("fwd_max_steer", 240.0)
+        self.declare_parameter("fwd_right_bias", 0.0)
 
-        # pwm limits
-        self.declare_parameter("min_turn_pwm", 250.0)   # başlangıç 250 dedin
-        self.declare_parameter("max_turn_pwm", 750.0)
-        self.declare_parameter("fine_band_deg", 10.0)
-        self.declare_parameter("fine_min_pwm", 120.0)
-        self.declare_parameter("fine_max_pwm", 320.0)
+        # Turn tuning (in-place)
+        self.declare_parameter("turn_base", 220.0)
+        self.declare_parameter("turn_kp", 420.0)
+        self.declare_parameter("turn_kd", 70.0)
+        self.declare_parameter("turn_max", 520.0)
 
-        # two simple knobs
-        self.declare_parameter("yaw_sign", 1.0)         # IMU yaw tersse -1.0
-        self.declare_parameter("turn_motor_sign", 1.0)  # motor dönüş tersse -1.0
+        # Turn stop logic (improved)
+        self.declare_parameter("turn_stop_err_deg", 3.5)        # error threshold
+        self.declare_parameter("turn_stop_wz_deg_s", 20.0)      # must be slow enough too
+        self.declare_parameter("turn_stop_hold_s", 0.10)        # must hold thresholds for this time
+        self.declare_parameter("turn_timeout_s", 3.5)
 
-        # optional trim/scale
-        self.declare_parameter("left_trim", 0.0)
-        self.declare_parameter("right_trim", 0.0)
-        self.declare_parameter("left_scale", 1.0)
-        self.declare_parameter("right_scale", 1.0)
-
-        # read
-        self.imu_topic = str(self.get_parameter("imu_topic").value)
-        self.motor_topic = str(self.get_parameter("motor_topic").value)
-
-        self.control_hz = float(self.get_parameter("control_hz").value)
-        self.imu_timeout_s = float(self.get_parameter("imu_timeout_s").value)
-
-        self.fwd_pwm = float(self.get_parameter("fwd_pwm").value)
-        self.slew_per_tick = int(self.get_parameter("slew_per_tick").value)
-
-        self.turn_step_deg = float(self.get_parameter("turn_step_deg").value)
-        self.turn_tol_deg = float(self.get_parameter("turn_tol_deg").value)
-        self.settle_s = float(self.get_parameter("settle_s").value)
-
-        self.kp = float(self.get_parameter("kp").value)
-        self.ki = float(self.get_parameter("ki").value)
-        self.kd = float(self.get_parameter("kd").value)
-        self.i_clamp_pwm = float(self.get_parameter("i_clamp_pwm").value)
-
-        self.min_turn_pwm = float(self.get_parameter("min_turn_pwm").value)
-        self.max_turn_pwm = float(self.get_parameter("max_turn_pwm").value)
-        self.fine_band_deg = float(self.get_parameter("fine_band_deg").value)
-        self.fine_min_pwm = float(self.get_parameter("fine_min_pwm").value)
-        self.fine_max_pwm = float(self.get_parameter("fine_max_pwm").value)
-
-        self.yaw_sign = float(self.get_parameter("yaw_sign").value)
-        self.turn_motor_sign = float(self.get_parameter("turn_motor_sign").value)
-
-        self.left_trim = float(self.get_parameter("left_trim").value)
-        self.right_trim = float(self.get_parameter("right_trim").value)
-        self.left_scale = float(self.get_parameter("left_scale").value)
-        self.right_scale = float(self.get_parameter("right_scale").value)
-
-        # ROS
-        qos = QoSProfile(
+        qos_fast = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        qos_motor = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        self.sub_imu = self.create_subscription(Imu, self.imu_topic, self.cb_imu, qos)
-        self.pub_motor = self.create_publisher(Int16MultiArray, self.motor_topic, 10)
 
-        # state
-        self.last_imu_t = 0.0
-        self.yaw_raw_deg: Optional[float] = None
-        self.yaw_corr_deg: Optional[float] = None
+        self.imu_topic = str(self.get_parameter("imu_topic").value)
+        self.cmd_topic = str(self.get_parameter("cmd_topic").value)
+        self.motor_cmd_topic = str(self.get_parameter("motor_cmd_topic").value)
+        self.debug_topic = str(self.get_parameter("debug_topic").value)
 
-        self.cmd_l = 0
-        self.cmd_r = 0
+        self.sub_imu = self.create_subscription(Imu, self.imu_topic, self.cb_imu, qos_fast)
+        self.sub_cmd = self.create_subscription(String, self.cmd_topic, self.cb_cmd, qos_fast)
 
-        # keyboard intents
-        self._lock = threading.Lock()
-        self._want_fwd = False
-        self._want_stop = False
-        self._want_quit = False
-        self._want_turn_left = False
-        self._want_turn_right = False
+        self.pub_motor = self.create_publisher(Int16MultiArray, self.motor_cmd_topic, qos_motor)
+        self.pub_debug = self.create_publisher(String, self.debug_topic, qos_fast)
 
-        # turn state
-        self.turning = False
-        self.target_corr_deg = 0.0
-        self._in_tol_since: Optional[float] = None
+        # IMU integrated state (global)
+        self.imu: Optional[ImuState] = None
+        self._yaw = 0.0
+        self._last_imu_t: Optional[float] = None
 
-        # PID state
-        self._e_prev = 0.0
-        self._i_state = 0.0
+        # Action state
+        self.mode = "IDLE"  # IDLE | FWD | TURN
+        self.yaw_ref = 0.0
+        self.action_end_t = 0.0
 
-        # timers
-        self._t_last = time.time()
-        dt = 1.0 / max(1.0, self.control_hz)
-        self.timer = self.create_timer(dt, self.tick)
+        # Turn-specific persisted info (for debugging / error)
+        self.turn_target_yaw = 0.0
+        self.turn_start_t = 0.0
+        self.turn_dir = "none"          # left/right
+        self.turn_cmd_deg = 0.0         # requested degrees
+        self.turn_yaw0 = 0.0            # yaw at turn start
+        self._turn_stop_hold_since = None
 
-        # keyboard thread
-        self._kb_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
-        self._kb_thread.start()
+        # Motor slew state
+        self._cmd_l = 0.0
+        self._cmd_r = 0.0
+        self._last_cmd_time = time.time()
 
-        self.get_logger().info("READY: target = yaw + step, PID lock")
-        self.get_logger().info("Fix knobs: yaw_sign (-1 if IMU yaw inverted), turn_motor_sign (-1 if motor turn inverted)")
+        self.timer = self.create_timer(0.02, self.step)  # 50 Hz
 
+        self.get_logger().info("imu_only_motion_node READY")
+        self.get_logger().info(f"Sub imu : {self.imu_topic}")
+        self.get_logger().info(f"Sub cmd : {self.cmd_topic}")
+        self.get_logger().info(f"Pub mot : {self.motor_cmd_topic}")
+        self.get_logger().info(f"Pub dbg : {self.debug_topic}")
+
+    # ----------------------------
+    # Callbacks
+    # ----------------------------
     def cb_imu(self, msg: Imu):
-        self.last_imu_t = time.time()
-        q = msg.orientation
-        yaw = wrap_deg(rad2deg(yaw_from_quat(q.x, q.y, q.z, q.w)))
-        self.yaw_raw_deg = yaw
-        self.yaw_corr_deg = wrap_deg(self.yaw_sign * yaw)
-
-    def publish_motor(self, l: int, r: int):
-        m = Int16MultiArray()
-        m.data = [int(clamp(l, -1000, 1000)), int(clamp(r, -1000, 1000))]
-        self.pub_motor.publish(m)
-
-    def motor_map(self, l: float, r: float):
-        l2 = l * self.left_scale + self.left_trim
-        r2 = r * self.right_scale + self.right_trim
-        l2 = int(round(clamp(l2, -1000.0, 1000.0)))
-        r2 = int(round(clamp(r2, -1000.0, 1000.0)))
-        return l2, r2
-
-    def slew(self, target: int, current: int) -> int:
-        d = target - current
-        if d > self.slew_per_tick:
-            d = self.slew_per_tick
-        elif d < -self.slew_per_tick:
-            d = -self.slew_per_tick
-        return current + d
-
-    def _pid_reset(self, e0: float):
-        self._e_prev = e0
-        self._i_state = 0.0
-        self._in_tol_since = None
-
-    def start_turn(self, step_deg: float):
-        if self.yaw_corr_deg is None:
-            return
-        self.turning = True
-        self.target_corr_deg = wrap_deg(self.yaw_corr_deg + step_deg)
-        e0 = wrap_deg(self.target_corr_deg - self.yaw_corr_deg)
-        self._pid_reset(e0)
-        self.get_logger().info(f"TURN start yaw_corr={self.yaw_corr_deg:+.2f} target_corr={self.target_corr_deg:+.2f}")
-
-    def _turn_pid(self, dt: float):
-        assert self.yaw_corr_deg is not None
-        e = wrap_deg(self.target_corr_deg - self.yaw_corr_deg)  # shortest error [-180,180)
-
-        # settle
-        if abs(e) <= self.turn_tol_deg:
-            if self._in_tol_since is None:
-                self._in_tol_since = time.time()
-            elif (time.time() - self._in_tol_since) >= self.settle_s:
-                self.turning = False
-                return 0.0, 0.0, True, e
-        else:
-            self._in_tol_since = None
-
-        # PID
-        de = (e - self._e_prev) / max(1e-3, dt)
-        self._e_prev = e
-
-        self._i_state += e * dt
-        i_pwm = clamp(self.ki * self._i_state, -self.i_clamp_pwm, self.i_clamp_pwm)
-
-        u = self.kp * e + i_pwm + self.kd * de  # signed pwm command (positive means "turn towards +error")
-
-        # choose pwm bounds (fine band)
-        if abs(e) <= self.fine_band_deg:
-            minp, maxp = self.fine_min_pwm, self.fine_max_pwm
-        else:
-            minp, maxp = self.min_turn_pwm, self.max_turn_pwm
-
-        s = 1.0 if u >= 0.0 else -1.0
-        pwm = abs(u)
-        pwm = max(minp, pwm)
-        pwm = min(maxp, pwm)
-        pwm *= s
-
-        # motor mapping: positive pwm should turn one direction; fix with turn_motor_sign
-        pwm *= self.turn_motor_sign
-
-        left = pwm
-        right = -pwm
-        return left, right, False, e
-
-    def tick(self):
         now = time.time()
-        dt = max(1e-3, now - self._t_last)
-        self._t_last = now
+        wz_sign = float(self.get_parameter("wz_sign").value)
+        wz = wz_sign * float(msg.angular_velocity.z)
 
-        if (now - self.last_imu_t) > self.imu_timeout_s or self.yaw_corr_deg is None:
-            self.cmd_l = self.slew(0, self.cmd_l)
-            self.cmd_r = self.slew(0, self.cmd_r)
-            self.publish_motor(self.cmd_l, self.cmd_r)
+        if self._last_imu_t is None:
+            self._last_imu_t = now
+        dt = clamp(now - self._last_imu_t, 0.0, 0.2)
+        self._last_imu_t = now
+
+        self._yaw = wrap_pi(self._yaw + wz * dt)
+        self.imu = ImuState(t=now, yaw=self._yaw, wz=wz)
+
+    def cb_cmd(self, msg: String):
+        cmd, val = parse_cmd(msg.data)
+
+        if cmd == "stop":
+            self.mode = "IDLE"
+            self._turn_stop_hold_since = None
+            self.publish_motor(0.0, 0.0, force=True)
+            self.debug("STOP")
             return
 
-        with self._lock:
-            want_fwd = self._want_fwd
-            want_stop = self._want_stop
-            want_quit = self._want_quit
-            want_L = self._want_turn_left
-            want_R = self._want_turn_right
-            self._want_turn_left = False
-            self._want_turn_right = False
-
-        if want_quit:
-            self.publish_motor(0, 0)
-            rclpy.shutdown()
+        if self.imu is None:
+            self.get_logger().warning("IMU not ready; ignoring cmd")
             return
 
-        if want_stop:
-            self.turning = False
-            self.cmd_l = self.slew(0, self.cmd_l)
-            self.cmd_r = self.slew(0, self.cmd_r)
-            self.publish_motor(self.cmd_l, self.cmd_r)
-            with self._lock:
-                self._want_stop = False
+        if cmd == "forward":
+            if val is None or val <= 0.0:
+                self.get_logger().warning("forward requires seconds: 'forward 2'")
+                return
+            self.mode = "FWD"
+            self.yaw_ref = self.imu.yaw
+            self.action_end_t = time.time() + float(val)
+            self.debug(f"FWD start {val:.2f}s yaw_ref={rad2deg(self.yaw_ref):.2f}deg")
             return
 
-        # start turn (priority)
-        if not self.turning:
-            if want_R:
-                self.start_turn(+self.turn_step_deg)
-            elif want_L:
-                self.start_turn(-self.turn_step_deg)
-
-        if self.turning:
-            left, right, done, e = self._turn_pid(dt)
-            if done:
-                self.cmd_l = self.slew(0, self.cmd_l)
-                self.cmd_r = self.slew(0, self.cmd_r)
-                self.publish_motor(self.cmd_l, self.cmd_r)
-                self.get_logger().info(f"TURN done yaw_corr={self.yaw_corr_deg:+.2f} err={e:+.2f}")
+        if cmd in ("left", "right"):
+            if val is None or val <= 0.0:
+                self.get_logger().warning("turn requires degrees: 'right 25'")
                 return
 
-            l_cmd, r_cmd = self.motor_map(left, right)
-            self.cmd_l = self.slew(l_cmd, self.cmd_l)
-            self.cmd_r = self.slew(r_cmd, self.cmd_r)
-            self.publish_motor(self.cmd_l, self.cmd_r)
+            deg = float(val)
+            delta = deg2rad(deg)
+            yaw0 = self.imu.yaw
+
+            # left => +delta, right => -delta (given your wz sign convention)
+            target = wrap_pi(yaw0 + delta) if cmd == "left" else wrap_pi(yaw0 - delta)
+
+            self.mode = "TURN"
+            self.turn_start_t = time.time()
+            self.turn_dir = cmd
+            self.turn_cmd_deg = deg
+            self.turn_yaw0 = yaw0
+            self.turn_target_yaw = target
+            self._turn_stop_hold_since = None
+
+            self.debug(
+                f"TURN start dir={cmd} cmd_deg={deg:.1f} yaw0={rad2deg(yaw0):.2f} "
+                f"target={rad2deg(target):.2f}"
+            )
             return
 
-        # forward hold
-        base = self.fwd_pwm if want_fwd else 0.0
-        l_cmd, r_cmd = self.motor_map(base, base)
-        self.cmd_l = self.slew(l_cmd, self.cmd_l)
-        self.cmd_r = self.slew(r_cmd, self.cmd_r)
-        self.publish_motor(self.cmd_l, self.cmd_r)
+    # ----------------------------
+    # Main loop
+    # ----------------------------
+    def step(self):
+        now = time.time()
 
-    def _keyboard_loop(self):
-        try:
-            import curses
-        except Exception as e:
-            self.get_logger().error(f"curses import failed: {e}")
+        imu_stale = float(self.get_parameter("imu_stale_s").value)
+        if self.imu is None or (now - self.imu.t) > imu_stale:
+            self.mode = "IDLE"
+            self._turn_stop_hold_since = None
+            self.publish_motor(0.0, 0.0)
             return
 
-        def loop(stdscr):
-            curses.noecho()
-            curses.cbreak()
-            stdscr.keypad(True)
-            stdscr.nodelay(True)
+        if self.mode == "IDLE":
+            self.publish_motor(0.0, 0.0)
+            return
 
-            stdscr.clear()
-            stdscr.addstr(0, 0, "IMU TURN PID TELEOP (target = yaw + 90)")
-            stdscr.addstr(1, 0, "UP hold=forward | LEFT/RIGHT=turn | SPACE=stop | Q/ESC=quit")
-            stdscr.addstr(2, 0, "Fix: yaw_sign=-1 if IMU inverted, turn_motor_sign=-1 if motor turn inverted")
-            stdscr.refresh()
+        if self.mode == "FWD":
+            if now >= self.action_end_t:
+                self.mode = "IDLE"
+                self.publish_motor(0.0, 0.0, force=True)
+                self.debug("FWD done")
+                return
+            self.step_forward_heading_hold()
+            return
 
-            last_up_t = 0.0
-            release_s = 0.12
-            poll_dt = 0.02
+        if self.mode == "TURN":
+            self.step_turn_in_place()
+            return
 
-            while rclpy.ok():
-                now = time.time()
-                ch = stdscr.getch()
+        self.mode = "IDLE"
+        self.publish_motor(0.0, 0.0)
 
-                if ch != -1:
-                    if ch == curses.KEY_UP:
-                        last_up_t = now
-                        with self._lock:
-                            self._want_fwd = True
-                    elif ch == curses.KEY_LEFT:
-                        with self._lock:
-                            self._want_fwd = False
-                            self._want_turn_left = True
-                    elif ch == curses.KEY_RIGHT:
-                        with self._lock:
-                            self._want_fwd = False
-                            self._want_turn_right = True
-                    elif ch == ord(' '):
-                        with self._lock:
-                            self._want_stop = True
-                    elif ch in (ord('q'), ord('Q'), 27):
-                        with self._lock:
-                            self._want_quit = True
-                        break
+    # ----------------------------
+    # Controllers
+    # ----------------------------
+    def step_forward_heading_hold(self):
+        imu = self.imu
+        assert imu is not None
 
-                if (now - last_up_t) > release_s:
-                    with self._lock:
-                        self._want_fwd = False
+        base = float(self.get_parameter("fwd_speed").value)
+        kp = float(self.get_parameter("fwd_kp").value)
+        kd = float(self.get_parameter("fwd_kd").value)
+        max_steer = float(self.get_parameter("fwd_max_steer").value)
 
-                try:
-                    yr = self.yaw_raw_deg
-                    yc = self.yaw_corr_deg
-                    stdscr.addstr(4, 0, f"yaw_raw : {yr:+8.2f}      " if yr is not None else "yaw_raw : (none)      ")
-                    stdscr.addstr(5, 0, f"yaw_corr: {yc:+8.2f}      " if yc is not None else "yaw_corr: (none)      ")
-                    if self.turning and yc is not None:
-                        e = wrap_deg(self.target_corr_deg - yc)
-                        stdscr.addstr(6, 0, f"turning: True target:{self.target_corr_deg:+8.2f} err:{e:+7.2f}      ")
-                    else:
-                        stdscr.addstr(6, 0, f"turning: False                                      ")
-                    stdscr.refresh()
-                except Exception:
-                    pass
+        err = wrap_pi(self.yaw_ref - imu.yaw)
+        steer = kp * err - kd * imu.wz
+        steer = clamp(steer, -max_steer, max_steer)
 
-                time.sleep(poll_dt)
+        l = base - steer
+        r = base + steer
 
-        try:
-            import curses
-            curses.wrapper(loop)
-        except Exception as e:
-            try:
-                self.publish_motor(0, 0)
-            except Exception:
-                pass
-            self.get_logger().error(f"Keyboard loop error: {e}")
+        rb = float(self.get_parameter("fwd_right_bias").value)
+        if r >= 0.0:
+            r += rb
+        else:
+            r -= rb
+
+        self.publish_motor(l, r)
+
+    def step_turn_in_place(self):
+        imu = self.imu
+        assert imu is not None
+
+        now = time.time()
+        timeout = float(self.get_parameter("turn_timeout_s").value)
+        if (now - self.turn_start_t) > timeout:
+            self.publish_motor(0.0, 0.0, force=True)
+            self.finish_turn(reason="timeout")
+            return
+
+        err = wrap_pi(self.turn_target_yaw - imu.yaw)   # rad
+        err_deg = abs(rad2deg(err))
+        wz_deg_s = abs(rad2deg(imu.wz))
+
+        stop_err = float(self.get_parameter("turn_stop_err_deg").value)
+        stop_wz = float(self.get_parameter("turn_stop_wz_deg_s").value)
+        hold_s = float(self.get_parameter("turn_stop_hold_s").value)
+
+        # require BOTH: small error and low angular velocity, held for hold_s
+        if (err_deg <= stop_err) and (wz_deg_s <= stop_wz):
+            if self._turn_stop_hold_since is None:
+                self._turn_stop_hold_since = now
+            if (now - self._turn_stop_hold_since) >= hold_s:
+                self.publish_motor(0.0, 0.0, force=True)
+                self.finish_turn(reason="threshold_hold")
+                return
+        else:
+            self._turn_stop_hold_since = None
+
+        kp = float(self.get_parameter("turn_kp").value)
+        kd = float(self.get_parameter("turn_kd").value)
+        base = float(self.get_parameter("turn_base").value)
+        u_max = float(self.get_parameter("turn_max").value)
+
+        u_pd = kp * err - kd * imu.wz
+        mag = clamp(abs(u_pd) + base, 0.0, u_max)
+
+        # err>0 => yaw should increase => turn left
+        sign = 1.0 if err >= 0.0 else -1.0
+
+        l = -sign * mag
+        r = +sign * mag
+
+        self.publish_motor(l, r)
+
+    def finish_turn(self, reason: str):
+        imu = self.imu
+        assert imu is not None
+
+        # compute final error vs target
+        err_final = wrap_pi(self.turn_target_yaw - imu.yaw)
+        err_final_deg = rad2deg(err_final)
+
+        # also compute actual delta moved vs requested
+        delta_actual = wrap_pi(imu.yaw - self.turn_yaw0)
+        delta_actual_deg = rad2deg(delta_actual)
+        delta_cmd = self.turn_cmd_deg if self.turn_dir == "left" else -self.turn_cmd_deg
+        delta_err_deg = delta_cmd - delta_actual_deg
+
+        msg = (
+            f"TURN DONE dir={self.turn_dir} reason={reason} "
+            f"cmd_deg={self.turn_cmd_deg:.1f} "
+            f"yaw0={rad2deg(self.turn_yaw0):.2f} "
+            f"target={rad2deg(self.turn_target_yaw):.2f} "
+            f"yaw={rad2deg(imu.yaw):.2f} "
+            f"err_to_target_deg={err_final_deg:.2f} "
+            f"delta_actual_deg={delta_actual_deg:.2f} "
+            f"delta_err_deg={delta_err_deg:.2f} "
+            f"elapsed={time.time()-self.turn_start_t:.2f}s"
+        )
+        self.get_logger().info(msg)
+        self.debug(msg)
+
+        self.mode = "IDLE"
+        self._turn_stop_hold_since = None
+
+    def debug(self, s: str):
+        m = String()
+        m.data = s
+        self.pub_debug.publish(m)
+
+    # ----------------------------
+    # Motor publish with slew
+    # ----------------------------
+    def publish_motor(self, l: float, r: float, force: bool = False):
+        now = time.time()
+        dt = max(1e-3, now - self._last_cmd_time)
+        self._last_cmd_time = now
+
+        limit = float(self.get_parameter("motor_limit").value)
+        slew = float(self.get_parameter("slew_per_sec").value)
+        max_step = slew * dt
+
+        l = clamp(l, -limit, limit)
+        r = clamp(r, -limit, limit)
+
+        if force:
+            self._cmd_l = l
+            self._cmd_r = r
+        else:
+            dl = clamp(l - self._cmd_l, -max_step, max_step)
+            dr = clamp(r - self._cmd_r, -max_step, max_step)
+            self._cmd_l += dl
+            self._cmd_r += dr
+
+        msg = Int16MultiArray()
+        msg.data = [int(round(self._cmd_l)), int(round(self._cmd_r))]
+        self.pub_motor.publish(msg)
 
 
 def main():
     rclpy.init()
-    node = ImuTurnPidTeleop()
+    node = ImuOnlyMotionNode()
     rclpy.spin(node)
-    try:
-        node.publish_motor(0, 0)
-    except Exception:
-        pass
     node.destroy_node()
     rclpy.shutdown()
 

@@ -67,20 +67,6 @@ def generate_launch_description():
         }],
     )
 
-    # --- NeoPixel UART ---
-    # neopixel = Node(
-    #     package="neopixel_uart",
-    #     executable="neopixel_uart_node",
-    #     name="neopixel_uart_node",
-    #     output="screen",
-    #     parameters=[{
-    #         "port": "/dev/ttyAMA0",
-    #         "baud": 115200,
-    #         "send_hz": 20,
-    #         "log_frames": False,
-    #     }],
-    # )
-
     # --- Servo driver ---
     servo = Node(
         package="servo_driver",
@@ -95,6 +81,7 @@ def generate_launch_description():
             "max_us": 2500,
             "min_deg": 0.0,
             "max_deg": 180.0,
+            "center_deg": 100.0,
             "period_us": 20000,
             "max_step_us": 15,
             "rt_priority": 10,
@@ -158,12 +145,6 @@ def generate_launch_description():
     #     name="lane_centerline_node",
     #     namespace="camera_bottom",
     #     output="screen",
-    #     parameters=[{
-    #         "in_topic": "/camera_bottom/lane_mask",
-    #         "out_topic": "/camera_bottom/center_lines",
-    #         "info_topic": "/camera_bottom/lane_info",
-    #         "skip_n": 0,
-    #     }],
     # )
 
     # --- rosbridge websocket (mobile/pc <-> ROS2) ---
@@ -210,18 +191,36 @@ def generate_launch_description():
         }],
     )
 
+    # --- Battery ADS1115 ---
+    battery = Node(
+        package="battery_manager",
+        executable="battery_manager_node",
+        name="battery_ads1115_node",
+        output="screen",
+        parameters=[{
+            "i2c_bus": 1,
+            "i2c_addr": 72,
+            "divider_ratio": 5.0,
+            "publish_hz": 2.0,
+            "ema_alpha": 0.3,
+        }],
+        remappings=[
+            ("/battery_status", "/battery_status"),
+        ],
+    )
+
     return LaunchDescription([
         bno08x,
         motor,
         camera_front,
         camera_bottom,
-        #neopixel,
         servo,
         lcd,
         audio,
-        #lane_mask,
-        #lane_center,
+        # lane_mask,
+        # lane_center,
         rosbridge,
         mobile_com,
         pico_com,
+        battery,
     ])

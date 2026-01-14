@@ -73,12 +73,12 @@ def _ang_dist(a, b):
     return min(d, 180.0 - d)
 
 def angle_to_vertical_signed_deg(x1, y1, x2, y2) -> float:
-    # signed relative to vertical axis (image y axis)
+    # signed relative to vertical axis
     dx = float(x2 - x1)
     dy = float(y2 - y1)
     if abs(dx) < 1e-6 and abs(dy) < 1e-6:
         return 0.0
-    ang = np.degrees(np.arctan2(dx, dy))  # note: dx,dy swapped -> vertical reference
+    ang = np.degrees(np.arctan2(dx, dy))  # vertical reference
     if ang > 90.0:
         ang -= 180.0
     if ang < -90.0:
@@ -301,7 +301,6 @@ def edge_to_structures(edge255: np.ndarray, params: dict):
         if st is None:
             continue
 
-        # avoid near-duplicate directions
         ok = True
         for ex in structs:
             if _ang_dist(st["angle"], ex["angle"]) < 18.0:
@@ -363,29 +362,14 @@ def compute_confidence(s: dict) -> float:
     score += 0.20 * angle_score
     return float(max(0.0, min(1.0, score)))
 
-def lane_feat_from_struct(s, w, h):
-    """
-    Her şey: açı, bottom intersect, mid offset, px ve norm offsetler
-    """
-    cx = w // 2
-    y_bottom = h - 1
-    y_mid = h // 2
-
-    conf = float(compute_confidence(s))
-    edges_count = int(len(s.get("edges", [])))
-    has_pair = bool(edges_count == 2)
-
-    center = s.get("center", None)
-    if center is None:
-        return None
-
-    x1, y1, x2, y2 = center
+def _feat_from_line(line, w, h, cx, y_bottom, y_mid):
+    x1, y1, x2, y2 = line
     ext = extend_to_borders(x1, y1, x2, y2, w, h)
     if ext is not None:
         x1, y1, x2, y2 = ext
 
-    ang_deg = float(s.get("angle", 0.0))
-    ang_to_vert_signed = float(angle_to_vertical_signed_deg(x1, y1, x2, y2))
+    ang_deg = _angle_deg(x1, y1, x2, y2)
+    ang_to_vert_signed = angle_to_vertical_signed_deg(x1, y1, x2, y2)
 
     xb = line_x_at_y(x1, y1, x2, y2, y_bottom)
     xm = line_x_at_y(x1, y1, x2, y2, y_mid)
@@ -401,32 +385,93 @@ def lane_feat_from_struct(s, w, h):
     bottom_dx_norm = float(bottom_dx_px / (w * 0.5 + 1e-9))
     mid_dx_norm = float(mid_dx_px / (w * 0.5 + 1e-9))
 
-    # also include center segment midpoint offset
     mid_x_seg = 0.5 * (x1 + x2)
     center_offset_px = float(mid_x_seg - cx)
     center_offset_norm = float(center_offset_px / (w * 0.5 + 1e-9))
 
     return {
-        "confidence": conf,
-        "has_pair": has_pair,
-        "edges_count": edges_count,
-
-        "angle_deg": ang_deg,
-        "angle_to_red_signed_deg": ang_to_vert_signed,  # same name you used
-
+        "angle_deg": float(ang_deg),
+        "angle_to_red_signed_deg": float(ang_to_vert_signed),
         "bottom_intersect_x_px": xb,
         "bottom_intersect_dx_px": bottom_dx_px,
         "bottom_intersect_x_norm": bottom_dx_norm,
-
         "mid_intersect_x_px": xm,
         "mid_intersect_dx_px": mid_dx_px,
         "mid_intersect_x_norm": mid_dx_norm,
-
         "center_offset_x_px": center_offset_px,
         "center_offset_x_norm": center_offset_norm,
-
-        "center": (int(x1), int(y1), int(x2), int(y2)),
+        "line": (int(x1), int(y1), int(x2), int(y2)),
         "angle_to_vertical_abs_err": float(_ang_dist(ang_deg, 90.0)),
+    }
+
+def lane_feat_from_struct_center(s, w, h):
+    cx = w // 2
+    y_bottom = h - 1
+    y_mid = h // 2
+
+    center = s.get("center", None)
+    if center is None:
+        return None
+
+    base = _feat_from_line(center, w, h, cx, y_bottom, y_mid)
+    if base is None:
+        return None
+
+    edges_count = int(len(s.get("edges", [])))
+    has_pair = bool(edges_count == 2)
+    conf = float(compute_confidence(s))
+
+    base.update({
+        "confidence": conf,
+        "has_pair": has_pair,
+        "edges_count": edges_count,
+        "center": base["line"],
+    })
+    return base
+
+def edge_feat_from_struct_single(s, w, h, lane_half_width_px: float):
+    """
+    centerline yokken tek turuncu edge'i kullan:
+    - edge'in bottom dx'i
+    - şeridi bulmak için önerilen arama yönü
+    - varsayımsal lane_half_width_px ile tahmini merkez dx
+    """
+    cx = w // 2
+    y_bottom = h - 1
+    y_mid = h // 2
+
+    edges = s.get("edges", [])
+    if len(edges) != 1:
+        return None
+
+    base = _feat_from_line(edges[0], w, h, cx, y_bottom, y_mid)
+    if base is None:
+        return None
+
+    edge_bottom_dx_px = float(base["bottom_intersect_dx_px"])
+    edge_bottom_dx_norm = float(base["bottom_intersect_x_norm"])
+
+    # Edge soldaysa (neg dx) muhtemelen sol sınır -> merkez daha sağda -> sağa "ara"
+    # Edge sağdaysa (pos dx) muhtemelen sağ sınır -> merkez daha solda -> sola "ara"
+    if edge_bottom_dx_px < 0.0:
+        search_dir = "right"
+        est_center_dx_px = edge_bottom_dx_px + float(lane_half_width_px)
+    else:
+        search_dir = "left"
+        est_center_dx_px = edge_bottom_dx_px - float(lane_half_width_px)
+
+    est_center_dx_norm = float(est_center_dx_px / (w * 0.5 + 1e-9))
+
+    return {
+        "confidence": float(compute_confidence(s)),
+        "edge_bottom_dx_px": edge_bottom_dx_px,
+        "edge_bottom_dx_norm": edge_bottom_dx_norm,
+        "search_dir": search_dir,
+        "estimated_center_dx_px": float(est_center_dx_px),
+        "estimated_center_dx_norm": float(est_center_dx_norm),
+        "edge_line": base["line"],
+        "angle_deg": float(base["angle_deg"]),
+        "angle_to_red_signed_deg": float(base["angle_to_red_signed_deg"]),
     }
 
 
@@ -457,11 +502,26 @@ def process_one(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.
     return edge, vis, structs
 
 
+# =========================================================
+# TURN / LOCK STATE
+# =========================================================
+def _norm(v: float) -> float:
+    return float(max(-1.0, min(1.0, v)))
+
+def _parse_turn_request(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s in ("left", "right", "straight", "none"):
+        return s
+    return "none"
+
+
 class LaneCenterlineNode320x240(Node):
     """
     Sub:  /camera_bottom/lane_mask        (mono8 0/255)  -> 320x240
     Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization
-    Pub:  /camera_bottom/lane_info        (String JSON)  -> HER FRAME (FAST)
+    Pub:  /camera_bottom/lane_info        (String JSON)  -> every frame
+    Sub:  /camera_bottom/turn_request     (String)       -> "left|right|straight|none"
+    Sub:  /camera_bottom/turn_done        (String)       -> "true/1" -> unlock
     """
     def __init__(self):
         super().__init__("lane_centerline_node")
@@ -469,12 +529,20 @@ class LaneCenterlineNode320x240(Node):
         self.declare_parameter("in_topic", "/camera_bottom/lane_mask")
         self.declare_parameter("out_topic", "/camera_bottom/center_lines")
         self.declare_parameter("info_topic", "/camera_bottom/lane_info")
+        self.declare_parameter("turn_request_topic", "/camera_bottom/turn_request")
+        self.declare_parameter("turn_done_topic", "/camera_bottom/turn_done")
         self.declare_parameter("skip_n", 0)
+
+        # single-edge heuristic
+        self.declare_parameter("lane_half_width_px", 60.0)
 
         self.in_topic = str(self.get_parameter("in_topic").value)
         self.out_topic = str(self.get_parameter("out_topic").value)
         self.info_topic = str(self.get_parameter("info_topic").value)
+        self.turn_request_topic = str(self.get_parameter("turn_request_topic").value)
+        self.turn_done_topic = str(self.get_parameter("turn_done_topic").value)
         self.skip_n = int(self.get_parameter("skip_n").value)
+        self.lane_half_width_px = float(self.get_parameter("lane_half_width_px").value)
 
         self.params = {
             "border_erase": BORDER_ERASE,
@@ -500,30 +568,81 @@ class LaneCenterlineNode320x240(Node):
         self.bridge = CvBridge()
         self._vis = np.zeros((H_TARGET, W_TARGET, 3), np.uint8)
 
-        # QoS: lowest latency
-        qos_in = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        qos_out = QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
-        self.sub = self.create_subscription(Image, self.in_topic, self.cb, qos_in)
-        self.pub_img = self.create_publisher(Image, self.out_topic, qos_out)
-        self.pub_info = self.create_publisher(String, self.info_topic, qos_out)
+        self.sub = self.create_subscription(Image, self.in_topic, self.cb, qos)
+        self.pub_img = self.create_publisher(Image, self.out_topic, qos)
+        self.pub_info = self.create_publisher(String, self.info_topic, qos)
 
+        self.sub_turn = self.create_subscription(String, self.turn_request_topic, self.cb_turn_request, qos)
+        self.sub_done = self.create_subscription(String, self.turn_done_topic, self.cb_turn_done, qos)
+
+        # state
         self._i = 0
         self._t_fps = time.time()
         self._n_fps = 0
 
-        self.get_logger().info("READY lane_centerline_node (FAST publish every frame)")
-        self.get_logger().info(f"Sub : {self.in_topic}")
-        self.get_logger().info(f"Pub : {self.out_topic}")
-        self.get_logger().info(f"Info: {self.info_topic}")
+        self.turn_request = "none"   # left|right|straight|none
+        self.turn_state = "IDLE"     # IDLE|LOCKED
+        self.locked_lane_id = None   # 1 or 2
+        self.lock_expire_t = 0.0     # safety timeout (optional)
+
+        self.get_logger().info("READY lane_centerline_node (intersection lock + single-edge hints)")
+        self.get_logger().info(f"Sub  : {self.in_topic}")
+        self.get_logger().info(f"Pub  : {self.out_topic}")
+        self.get_logger().info(f"Info : {self.info_topic}")
+        self.get_logger().info(f"Turn : {self.turn_request_topic} / {self.turn_done_topic}")
+
+    def cb_turn_request(self, msg: String):
+        req = _parse_turn_request(msg.data)
+        self.turn_request = req
+        # request gelince bir sonraki intersection frame'inde lock atacağız
+        # straight: lane1 (merkeze yakın) lock
+        self.get_logger().info(f"turn_request = {self.turn_request}")
+
+    def cb_turn_done(self, msg: String):
+        s = (msg.data or "").strip().lower()
+        done = (s in ("1", "true", "yes", "done", "ok"))
+        if done:
+            self.turn_state = "IDLE"
+            self.locked_lane_id = None
+            self.turn_request = "none"
+            self.get_logger().info("turn_done -> unlock")
+
+    def _choose_lane_with_turn(self, lane1, lane2):
+        """
+        lane1/lane2: packed feat dicts (centerline)
+        Return (selected_lane_id, selected_feat)
+        """
+        if lane1 is None and lane2 is None:
+            return (None, None)
+        if lane2 is None:
+            return (1, lane1)
+        if lane1 is None:
+            return (2, lane2)
+
+        # both exist: intersection candidate
+        # decide by request
+        if self.turn_request == "left":
+            # choose the lane whose bottom dx is more negative (more left)
+            if lane1["bottom_intersect_dx_px"] <= lane2["bottom_intersect_dx_px"]:
+                return (1, lane1)
+            else:
+                return (2, lane2)
+        if self.turn_request == "right":
+            # choose more positive
+            if lane1["bottom_intersect_dx_px"] >= lane2["bottom_intersect_dx_px"]:
+                return (1, lane1)
+            else:
+                return (2, lane2)
+        # straight or none -> choose closest to center
+        if abs(lane1["bottom_intersect_dx_px"]) <= abs(lane2["bottom_intersect_dx_px"]):
+            return (1, lane1)
+        return (2, lane2)
 
     def cb(self, msg: Image):
         self._i += 1
@@ -542,20 +661,53 @@ class LaneCenterlineNode320x240(Node):
 
         _, vis, structs = process_one(mask, self.params, self.cache, self._vis)
 
-        # ---- build feats (only those with centerline)
-        dets = []
+        # ---- centerline feats
+        center_dets = []
+        # ---- single-edge dets (centerline olmayanlar)
+        single_edges = []
+
         for s in structs:
-            feat = lane_feat_from_struct(s, W_TARGET, H_TARGET)
-            if feat is None:
-                continue
-            dets.append(feat)
+            f = lane_feat_from_struct_center(s, W_TARGET, H_TARGET)
+            if f is not None:
+                center_dets.append(f)
+            else:
+                e = edge_feat_from_struct_single(s, W_TARGET, H_TARGET, self.lane_half_width_px)
+                if e is not None:
+                    single_edges.append(e)
 
-        # ---- sort by angle closeness to vertical (90deg) -> lane1 green
-        dets_sorted = sorted(dets, key=lambda d: d["angle_to_vertical_abs_err"])
-        lane1 = dets_sorted[0] if len(dets_sorted) >= 1 else None
-        lane2 = dets_sorted[1] if len(dets_sorted) >= 2 else None
+        # ---- sort centerline dets by vertical closeness
+        center_sorted = sorted(center_dets, key=lambda d: d["angle_to_vertical_abs_err"])
+        lane1 = center_sorted[0] if len(center_sorted) >= 1 else None
+        lane2 = center_sorted[1] if len(center_sorted) >= 2 else None
 
-        # ---- draw lane1 (green) + lane2 (blue)
+        intersection = bool(lane1 is not None and lane2 is not None)
+
+        # ---- lock logic:
+        # If LOCKED -> keep locked lane id if available
+        # If IDLE and intersection and request != none -> lock chosen lane
+        selected_lane_id = None
+        selected_lane = None
+
+        if self.turn_state == "LOCKED":
+            if self.locked_lane_id == 1 and lane1 is not None:
+                selected_lane_id, selected_lane = (1, lane1)
+            elif self.locked_lane_id == 2 and lane2 is not None:
+                selected_lane_id, selected_lane = (2, lane2)
+            else:
+                # locked lane not visible -> fall back (do not auto-switch unless you want)
+                selected_lane_id, selected_lane = self._choose_lane_with_turn(lane1, lane2)
+
+        else:
+            # IDLE
+            if intersection and self.turn_request in ("left", "right", "straight"):
+                chosen_id, chosen = self._choose_lane_with_turn(lane1, lane2)
+                self.turn_state = "LOCKED"
+                self.locked_lane_id = chosen_id
+                selected_lane_id, selected_lane = (chosen_id, chosen)
+            else:
+                selected_lane_id, selected_lane = self._choose_lane_with_turn(lane1, lane2)
+
+        # ---- draw centerlines (green/blue) as before
         def draw_center(feat, color):
             if feat is None:
                 return
@@ -574,24 +726,32 @@ class LaneCenterlineNode320x240(Node):
         out_img.header = msg.header
         self.pub_img.publish(out_img)
 
-        # ---- publish info (every frame)
+        # ---- build info
         cx = W_TARGET // 2
         info = {
             "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
             "img": {"w": W_TARGET, "h": H_TARGET, "center_x": cx, "bottom_y": H_TARGET - 1, "mid_y": H_TARGET // 2},
 
-            "lane_count_detected": int(len(dets_sorted)),
-            "valid_lane1": bool(lane1 is not None),
-            "valid_lane2": bool(lane2 is not None),
+            "intersection": bool(intersection),
+            "lane_count_centerline": int(len(center_sorted)),
+            "lane_count_single_edge": int(len(single_edges)),
+
+            "turn": {
+                "request": self.turn_request,
+                "state": self.turn_state,
+                "locked_lane_id": int(self.locked_lane_id) if self.locked_lane_id is not None else None,
+                "selected_lane_id": int(selected_lane_id) if selected_lane_id is not None else None,
+            },
 
             "lane1": None,
             "lane2": None,
+            "selected": None,
 
-            # debug: all detections this frame
-            "lanes_detected": [],
+            "lanes_centerline": [],
+            "lanes_single_edge": [],
         }
 
-        def pack_lane(feat, lane_id: int):
+        def pack_center(feat, lane_id: int):
             if feat is None:
                 return None
             return {
@@ -599,24 +759,22 @@ class LaneCenterlineNode320x240(Node):
                 "confidence": float(feat["confidence"]),
                 "has_pair": bool(feat["has_pair"]),
                 "edges_count": int(feat["edges_count"]),
-
                 "angle_deg": float(feat["angle_deg"]),
                 "angle_to_red_signed_deg": float(feat["angle_to_red_signed_deg"]),
-
                 "bottom_intersect_x_norm": float(feat["bottom_intersect_x_norm"]),
                 "mid_intersect_x_norm": float(feat["mid_intersect_x_norm"]),
                 "center_offset_x_norm": float(feat["center_offset_x_norm"]),
-
                 "bottom_intersect_dx_px": float(feat["bottom_intersect_dx_px"]),
                 "mid_intersect_dx_px": float(feat["mid_intersect_dx_px"]),
                 "center_offset_x_px": float(feat["center_offset_x_px"]),
             }
 
-        info["lane1"] = pack_lane(lane1, 1)
-        info["lane2"] = pack_lane(lane2, 2)
+        info["lane1"] = pack_center(lane1, 1)
+        info["lane2"] = pack_center(lane2, 2)
+        info["selected"] = pack_center(selected_lane, int(selected_lane_id) if selected_lane_id else 0)
 
-        for d in dets_sorted:
-            info["lanes_detected"].append({
+        for d in center_sorted:
+            info["lanes_centerline"].append({
                 "confidence": float(d["confidence"]),
                 "has_pair": bool(d["has_pair"]),
                 "edges_count": int(d["edges_count"]),
@@ -631,6 +789,19 @@ class LaneCenterlineNode320x240(Node):
                 "angle_to_vertical_abs_err": float(d["angle_to_vertical_abs_err"]),
             })
 
+        # single-edge hints
+        for e in single_edges:
+            info["lanes_single_edge"].append({
+                "confidence": float(e["confidence"]),
+                "edge_bottom_dx_norm": _norm(e["edge_bottom_dx_norm"]),
+                "edge_bottom_dx_px": float(e["edge_bottom_dx_px"]),
+                "search_dir": str(e["search_dir"]),
+                "estimated_center_dx_norm": _norm(e["estimated_center_dx_norm"]),
+                "estimated_center_dx_px": float(e["estimated_center_dx_px"]),
+                "angle_deg": float(e["angle_deg"]),
+                "angle_to_red_signed_deg": float(e["angle_to_red_signed_deg"]),
+            })
+
         m = String()
         m.data = json.dumps(info, separators=(",", ":"))
         self.pub_info.publish(m)
@@ -640,7 +811,7 @@ class LaneCenterlineNode320x240(Node):
         now = time.time()
         if now - self._t_fps >= 2.0:
             fps = self._n_fps / (now - self._t_fps)
-            self.get_logger().info(f"lane_centerline_node fps ~ {fps:.2f} (publishing info every frame)")
+            self.get_logger().info(f"lane_centerline_node fps ~ {fps:.2f}")
             self._t_fps = now
             self._n_fps = 0
 

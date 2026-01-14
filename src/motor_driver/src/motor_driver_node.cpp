@@ -37,14 +37,13 @@ public:
     right_fwd_ = this->get_parameter("right_fwd").as_int();
     right_rev_ = this->get_parameter("right_rev").as_int();
 
-    gpiochip_  = this->get_parameter("gpiochip").as_string();
-    pwm_hz_    = this->get_parameter("pwm_hz").as_int();
-    timeout_ms_= this->get_parameter("timeout_ms").as_int();
+    gpiochip_   = this->get_parameter("gpiochip").as_string();
+    pwm_hz_     = this->get_parameter("pwm_hz").as_int();
+    timeout_ms_ = this->get_parameter("timeout_ms").as_int();
 
     inv_l_ = this->get_parameter("invert_left").as_bool();
     inv_r_ = this->get_parameter("invert_right").as_bool();
 
-    // ===== GPIO OPEN =====
     chip_ = std::make_unique<gpiod::chip>(gpiochip_);
 
     req_output(left_fwd_);
@@ -56,9 +55,7 @@ public:
 
     sub_ = this->create_subscription<std_msgs::msg::Int16MultiArray>(
       "/motor_cmd", 10,
-      [this](std_msgs::msg::Int16MultiArray::SharedPtr msg) {
-        on_motor_cmd(*msg);
-      }
+      [this](std_msgs::msg::Int16MultiArray::SharedPtr msg) { on_motor_cmd(*msg); }
     );
 
     last_cmd_ = this->now();
@@ -91,9 +88,7 @@ public:
 private:
   void req_output(int gpio) {
     auto line = chip_->get_line(gpio);
-    line.request(
-      { "motor_driver", gpiod::line_request::DIRECTION_OUTPUT, 0 }, 0
-    );
+    line.request({ "motor_driver", gpiod::line_request::DIRECTION_OUTPUT, 0 }, 0);
     lines_[gpio] = std::move(line);
   }
 
@@ -125,12 +120,57 @@ private:
     target_r_ = r;
   }
 
+  struct Chan {
+    int dir;   // -1,0,+1
+    int duty;  // 0..1000
+    int fwd;
+    int rev;
+  };
+
+  static inline int abs_i(int x) { return x < 0 ? -x : x; }
+
+  Chan compute_chan(int val, int fwd, int rev) {
+    Chan c{};
+    c.fwd = fwd;
+    c.rev = rev;
+
+    val = clampi(val, -1000, 1000);
+    if (val == 0) {
+      c.dir = 0;
+      c.duty = 0;
+      // iki pini de kapat
+      write_gpio(fwd, 0);
+      write_gpio(rev, 0);
+      return c;
+    }
+
+    c.dir = (val > 0) ? 1 : -1;
+    c.duty = abs_i(val); // 0..1000
+
+    // karşı yön pinini kapat (shoot-through önlemi)
+    if (c.dir > 0) write_gpio(rev, 0);
+    else           write_gpio(fwd, 0);
+
+    return c;
+  }
+
+  void set_on(const Chan& c) {
+    if (c.duty <= 0 || c.dir == 0) return;
+    if (c.dir > 0) write_gpio(c.fwd, 1);
+    else           write_gpio(c.rev, 1);
+  }
+
+  void set_off(const Chan& c) {
+    // hangi yönde olursa olsun iki pini de kapatmak güvenli
+    write_gpio(c.fwd, 0);
+    write_gpio(c.rev, 0);
+  }
+
   void pwm_loop() {
     using clock = std::chrono::steady_clock;
 
     const int hz = std::max(1, pwm_hz_);
-    const auto period =
-      std::chrono::duration_cast<std::chrono::microseconds>(1s) / hz;
+    const auto period = std::chrono::duration_cast<std::chrono::microseconds>(1s) / hz;
 
     while (running_.load()) {
       int l, r;
@@ -140,49 +180,42 @@ private:
         r = target_r_;
       }
 
-      auto t0 = clock::now();
+      const auto t0 = clock::now();
 
-      auto apply = [&](int val, int fwd, int rev) {
-        if (val == 0) {
-          write_gpio(fwd, 0);
-          write_gpio(rev, 0);
-          return std::pair<int,int>(0, 0);
-        }
+      // her kanal için dir + duty hesapla
+      Chan L = compute_chan(l, left_fwd_, left_rev_);
+      Chan R = compute_chan(r, right_fwd_, right_rev_);
 
-        val = clampi(val, -1000, 1000);
-        int dir = (val > 0) ? 1 : -1;
-        int duty = std::abs(val); // 0..1000
+      // duty -> on_time (mikrosaniye)
+      const int64_t period_us = period.count();
+      int64_t onL_us = (period_us * L.duty) / 1000;
+      int64_t onR_us = (period_us * R.duty) / 1000;
 
-        if (dir > 0) write_gpio(rev, 0);
-        else         write_gpio(fwd, 0);
+      // ON: ikisini de başlat
+      set_on(L);
+      set_on(R);
 
-        return std::pair<int,int>(dir, duty);
-      };
+      // farklı duty uygulaması: hangisi önce bitecekse onu önce kapat
+      int64_t first_us = std::min(onL_us, onR_us);
+      int64_t second_us = std::max(onL_us, onR_us);
 
-      auto [ld, lduty] = apply(l, left_fwd_, left_rev_);
-      auto [rd, rduty] = apply(r, right_fwd_, right_rev_);
+      // first_us kadar bekle
+      if (first_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(first_us));
 
-      int on_duty = std::max(lduty, rduty);
-      double on_frac = on_duty / 1000.0;
-      auto on_time =
-        std::chrono::duration_cast<std::chrono::microseconds>(period * on_frac);
+      // first kapanış
+      if (onL_us == first_us) set_off(L);
+      if (onR_us == first_us) set_off(R);
 
-      // ON
-      if (ld > 0) write_gpio(left_fwd_, 1);
-      if (ld < 0) write_gpio(left_rev_, 1);
-      if (rd > 0) write_gpio(right_fwd_, 1);
-      if (rd < 0) write_gpio(right_rev_, 1);
+      // ikinci kapanışa kadar kalan süre
+      int64_t mid_us = second_us - first_us;
+      if (mid_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(mid_us));
 
-      if (on_time.count() > 0) std::this_thread::sleep_for(on_time);
+      // second kapanış (hala açıksa kapat)
+      if (onL_us == second_us) set_off(L);
+      if (onR_us == second_us) set_off(R);
 
-      // OFF
-      if (ld > 0) write_gpio(left_fwd_, 0);
-      if (ld < 0) write_gpio(left_rev_, 0);
-      if (rd > 0) write_gpio(right_fwd_, 0);
-      if (rd < 0) write_gpio(right_rev_, 0);
-
-      auto spent =
-        std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0);
+      // periyodun kalanını bekle
+      const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0);
       if (spent < period) std::this_thread::sleep_for(period - spent);
     }
   }
