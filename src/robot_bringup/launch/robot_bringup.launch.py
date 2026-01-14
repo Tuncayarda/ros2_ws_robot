@@ -68,18 +68,18 @@ def generate_launch_description():
     )
 
     # --- NeoPixel UART ---
-    neopixel = Node(
-        package="neopixel_uart",
-        executable="neopixel_uart_node",
-        name="neopixel_uart_node",
-        output="screen",
-        parameters=[{
-            "port": "/dev/ttyAMA0",
-            "baud": 115200,
-            "send_hz": 20,
-            "log_frames": False,
-        }],
-    )
+    # neopixel = Node(
+    #     package="neopixel_uart",
+    #     executable="neopixel_uart_node",
+    #     name="neopixel_uart_node",
+    #     output="screen",
+    #     parameters=[{
+    #         "port": "/dev/ttyAMA0",
+    #         "baud": 115200,
+    #         "send_hz": 20,
+    #         "log_frames": False,
+    #     }],
+    # )
 
     # --- Servo driver ---
     servo = Node(
@@ -193,12 +193,29 @@ def generate_launch_description():
         }],
     )
 
+    # --- Pico COM (LED TX + Sensor RX) ---
+    pico_com = Node(
+        package="pico_com",
+        executable="pico_com",
+        name="pico_com",
+        output="screen",
+        parameters=[{
+            "port": "/dev/ttyAMA0",
+            "baud": 115200,
+            "send_hz": 20,
+            "rx_hz": 200,
+            "frame_timeout_ms": 80,
+            "log_frames": False,
+            "publish_raw": False,
+        }],
+    )
+
     return LaunchDescription([
         bno08x,
         motor,
         camera_front,
         camera_bottom,
-        neopixel,
+        #neopixel,
         servo,
         lcd,
         audio,
@@ -206,4 +223,5 @@ def generate_launch_description():
         #lane_center,
         rosbridge,
         mobile_com,
+        pico_com,
     ])
