@@ -39,8 +39,12 @@ LANE_EDGE_COLOR = (0, 140, 255)     # BGR orange
 LANE_EDGE_THICKNESS = 2
 DRAW_LINE_TYPE = cv2.LINE_8
 
-COLOR_LANE1 = (0, 255, 0)   # green
-COLOR_LANE2 = (255, 0, 0)   # blue
+COLOR_SELECTED = (0, 255, 0)  # green
+COLOR_OTHER    = (255, 0, 0)  # blue
+
+# NEW: selected center point drawing
+SELECTED_POINT_COLOR = (0, 0, 255)  # red
+SELECTED_POINT_RADIUS = 5
 
 
 # =========================================================
@@ -430,12 +434,6 @@ def lane_feat_from_struct_center(s, w, h):
     return base
 
 def edge_feat_from_struct_single(s, w, h, lane_half_width_px: float):
-    """
-    centerline yokken tek turuncu edge'i kullan:
-    - edge'in bottom dx'i
-    - şeridi bulmak için önerilen arama yönü
-    - varsayımsal lane_half_width_px ile tahmini merkez dx
-    """
     cx = w // 2
     y_bottom = h - 1
     y_mid = h // 2
@@ -451,8 +449,6 @@ def edge_feat_from_struct_single(s, w, h, lane_half_width_px: float):
     edge_bottom_dx_px = float(base["bottom_intersect_dx_px"])
     edge_bottom_dx_norm = float(base["bottom_intersect_x_norm"])
 
-    # Edge soldaysa (neg dx) muhtemelen sol sınır -> merkez daha sağda -> sağa "ara"
-    # Edge sağdaysa (pos dx) muhtemelen sağ sınır -> merkez daha solda -> sola "ara"
     if edge_bottom_dx_px < 0.0:
         search_dir = "right"
         est_center_dx_px = edge_bottom_dx_px + float(lane_half_width_px)
@@ -503,34 +499,20 @@ def process_one(mask255: np.ndarray, params: dict, cache: PreprocCache, vis: np.
 
 
 # =========================================================
-# TURN / LOCK STATE
+# TURN / CONTROL UTIL
 # =========================================================
 def _norm(v: float) -> float:
     return float(max(-1.0, min(1.0, v)))
 
-def _parse_turn_request(s: str) -> str:
-    s = (s or "").strip().lower()
-    if s in ("left", "right", "straight", "none"):
-        return s
-    return "none"
-
 
 class LaneCenterlineNode320x240(Node):
-    """
-    Sub:  /camera_bottom/lane_mask        (mono8 0/255)  -> 320x240
-    Pub:  /camera_bottom/center_lines     (bgr8)         -> 320x240 visualization
-    Pub:  /camera_bottom/lane_info        (String JSON)  -> every frame
-    Sub:  /camera_bottom/turn_request     (String)       -> "left|right|straight|none"
-    Sub:  /camera_bottom/turn_done        (String)       -> "true/1" -> unlock
-    """
     def __init__(self):
         super().__init__("lane_centerline_node")
 
         self.declare_parameter("in_topic", "/camera_bottom/lane_mask")
         self.declare_parameter("out_topic", "/camera_bottom/center_lines")
         self.declare_parameter("info_topic", "/camera_bottom/lane_info")
-        self.declare_parameter("turn_request_topic", "/camera_bottom/turn_request")
-        self.declare_parameter("turn_done_topic", "/camera_bottom/turn_done")
+        self.declare_parameter("change_lane_topic", "/camera_bottom/change_lane")
         self.declare_parameter("skip_n", 0)
 
         # single-edge heuristic
@@ -539,8 +521,7 @@ class LaneCenterlineNode320x240(Node):
         self.in_topic = str(self.get_parameter("in_topic").value)
         self.out_topic = str(self.get_parameter("out_topic").value)
         self.info_topic = str(self.get_parameter("info_topic").value)
-        self.turn_request_topic = str(self.get_parameter("turn_request_topic").value)
-        self.turn_done_topic = str(self.get_parameter("turn_done_topic").value)
+        self.change_lane_topic = str(self.get_parameter("change_lane_topic").value)
         self.skip_n = int(self.get_parameter("skip_n").value)
         self.lane_half_width_px = float(self.get_parameter("lane_half_width_px").value)
 
@@ -578,71 +559,34 @@ class LaneCenterlineNode320x240(Node):
         self.pub_img = self.create_publisher(Image, self.out_topic, qos)
         self.pub_info = self.create_publisher(String, self.info_topic, qos)
 
-        self.sub_turn = self.create_subscription(String, self.turn_request_topic, self.cb_turn_request, qos)
-        self.sub_done = self.create_subscription(String, self.turn_done_topic, self.cb_turn_done, qos)
+        self.sub_change = self.create_subscription(String, self.change_lane_topic, self.cb_change_lane, qos)
 
         # state
         self._i = 0
         self._t_fps = time.time()
         self._n_fps = 0
 
-        self.turn_request = "none"   # left|right|straight|none
-        self.turn_state = "IDLE"     # IDLE|LOCKED
-        self.locked_lane_id = None   # 1 or 2
-        self.lock_expire_t = 0.0     # safety timeout (optional)
+        self.selected_lane_id = 1
 
-        self.get_logger().info("READY lane_centerline_node (intersection lock + single-edge hints)")
+        self.get_logger().info("READY lane_centerline_node (manual lane select + no auto switch at intersections)")
         self.get_logger().info(f"Sub  : {self.in_topic}")
         self.get_logger().info(f"Pub  : {self.out_topic}")
         self.get_logger().info(f"Info : {self.info_topic}")
-        self.get_logger().info(f"Turn : {self.turn_request_topic} / {self.turn_done_topic}")
+        self.get_logger().info(f"ChangeLane : {self.change_lane_topic}")
 
-    def cb_turn_request(self, msg: String):
-        req = _parse_turn_request(msg.data)
-        self.turn_request = req
-        # request gelince bir sonraki intersection frame'inde lock atacağız
-        # straight: lane1 (merkeze yakın) lock
-        self.get_logger().info(f"turn_request = {self.turn_request}")
-
-    def cb_turn_done(self, msg: String):
+    def cb_change_lane(self, msg: String):
         s = (msg.data or "").strip().lower()
-        done = (s in ("1", "true", "yes", "done", "ok"))
-        if done:
-            self.turn_state = "IDLE"
-            self.locked_lane_id = None
-            self.turn_request = "none"
-            self.get_logger().info("turn_done -> unlock")
-
-    def _choose_lane_with_turn(self, lane1, lane2):
-        """
-        lane1/lane2: packed feat dicts (centerline)
-        Return (selected_lane_id, selected_feat)
-        """
-        if lane1 is None and lane2 is None:
-            return (None, None)
-        if lane2 is None:
-            return (1, lane1)
-        if lane1 is None:
-            return (2, lane2)
-
-        # both exist: intersection candidate
-        # decide by request
-        if self.turn_request == "left":
-            # choose the lane whose bottom dx is more negative (more left)
-            if lane1["bottom_intersect_dx_px"] <= lane2["bottom_intersect_dx_px"]:
-                return (1, lane1)
-            else:
-                return (2, lane2)
-        if self.turn_request == "right":
-            # choose more positive
-            if lane1["bottom_intersect_dx_px"] >= lane2["bottom_intersect_dx_px"]:
-                return (1, lane1)
-            else:
-                return (2, lane2)
-        # straight or none -> choose closest to center
-        if abs(lane1["bottom_intersect_dx_px"]) <= abs(lane2["bottom_intersect_dx_px"]):
-            return (1, lane1)
-        return (2, lane2)
+        if s in ("1", "lane1"):
+            self.selected_lane_id = 1
+            self.get_logger().info("change_lane -> selected lane1")
+        elif s in ("2", "lane2"):
+            self.selected_lane_id = 2
+            self.get_logger().info("change_lane -> selected lane2")
+        elif s in ("toggle", "switch"):
+            self.selected_lane_id = 2 if self.selected_lane_id == 1 else 1
+            self.get_logger().info(f"change_lane -> toggled to lane{self.selected_lane_id}")
+        else:
+            self.get_logger().warning(f"change_lane ignored: '{msg.data}'")
 
     def cb(self, msg: Image):
         self._i += 1
@@ -661,9 +605,7 @@ class LaneCenterlineNode320x240(Node):
 
         _, vis, structs = process_one(mask, self.params, self.cache, self._vis)
 
-        # ---- centerline feats
         center_dets = []
-        # ---- single-edge dets (centerline olmayanlar)
         single_edges = []
 
         for s in structs:
@@ -675,39 +617,34 @@ class LaneCenterlineNode320x240(Node):
                 if e is not None:
                     single_edges.append(e)
 
-        # ---- sort centerline dets by vertical closeness
         center_sorted = sorted(center_dets, key=lambda d: d["angle_to_vertical_abs_err"])
         lane1 = center_sorted[0] if len(center_sorted) >= 1 else None
         lane2 = center_sorted[1] if len(center_sorted) >= 2 else None
 
         intersection = bool(lane1 is not None and lane2 is not None)
 
-        # ---- lock logic:
-        # If LOCKED -> keep locked lane id if available
-        # If IDLE and intersection and request != none -> lock chosen lane
         selected_lane_id = None
         selected_lane = None
 
-        if self.turn_state == "LOCKED":
-            if self.locked_lane_id == 1 and lane1 is not None:
-                selected_lane_id, selected_lane = (1, lane1)
-            elif self.locked_lane_id == 2 and lane2 is not None:
-                selected_lane_id, selected_lane = (2, lane2)
-            else:
-                # locked lane not visible -> fall back (do not auto-switch unless you want)
-                selected_lane_id, selected_lane = self._choose_lane_with_turn(lane1, lane2)
+        if lane1 is not None and lane2 is None:
+            self.selected_lane_id = 1
+        elif lane2 is not None and lane1 is None:
+            self.selected_lane_id = 2
 
+        if self.selected_lane_id == 1 and lane1 is not None:
+            selected_lane_id, selected_lane = 1, lane1
+        elif self.selected_lane_id == 2 and lane2 is not None:
+            selected_lane_id, selected_lane = 2, lane2
         else:
-            # IDLE
-            if intersection and self.turn_request in ("left", "right", "straight"):
-                chosen_id, chosen = self._choose_lane_with_turn(lane1, lane2)
-                self.turn_state = "LOCKED"
-                self.locked_lane_id = chosen_id
-                selected_lane_id, selected_lane = (chosen_id, chosen)
+            if lane1 is not None:
+                self.selected_lane_id = 1
+                selected_lane_id, selected_lane = 1, lane1
+            elif lane2 is not None:
+                self.selected_lane_id = 2
+                selected_lane_id, selected_lane = 2, lane2
             else:
-                selected_lane_id, selected_lane = self._choose_lane_with_turn(lane1, lane2)
+                selected_lane_id, selected_lane = None, None
 
-        # ---- draw centerlines (green/blue) as before
         def draw_center(feat, color):
             if feat is None:
                 return
@@ -718,15 +655,56 @@ class LaneCenterlineNode320x240(Node):
             ex1, ey1, ex2, ey2 = ext
             cv2.line(vis, (ex1, ey1), (ex2, ey2), color, self.params["center_thickness"], DRAW_LINE_TYPE)
 
-        draw_center(lane1, COLOR_LANE1)
-        draw_center(lane2, COLOR_LANE2)
+        if selected_lane_id == 1:
+            draw_center(lane1, COLOR_SELECTED)
+            draw_center(lane2, COLOR_OTHER)
+        elif selected_lane_id == 2:
+            draw_center(lane2, COLOR_SELECTED)
+            draw_center(lane1, COLOR_OTHER)
+        else:
+            draw_center(lane1, COLOR_OTHER)
+            draw_center(lane2, COLOR_OTHER)
+
+        # =========================
+        # NEW: selected line center point (x at y=mid_y)
+        # =========================
+        selected_line_center = None
+        if selected_lane is not None and "center" in selected_lane and selected_lane["center"] is not None:
+            x1, y1, x2, y2 = selected_lane["center"]
+            ext = extend_to_borders(x1, y1, x2, y2, W_TARGET, H_TARGET)
+            if ext is not None:
+                ex1, ey1, ex2, ey2 = ext
+                y_mid = H_TARGET // 2
+                xm = line_x_at_y(ex1, ey1, ex2, ey2, y_mid)
+                if xm is not None:
+                    xm = float(clamp(xm, 0.0, float(W_TARGET - 1)))
+                    cx = W_TARGET // 2
+                    dx_px = xm - float(cx)
+                    dx_norm = float(dx_px / (W_TARGET * 0.5 + 1e-9))
+
+                    # draw red dot
+                    cv2.circle(
+                        vis,
+                        (int(round(xm)), int(y_mid)),
+                        SELECTED_POINT_RADIUS,
+                        SELECTED_POINT_COLOR,
+                        -1,
+                        lineType=DRAW_LINE_TYPE
+                    )
+
+                    selected_line_center = {
+                        "x_px": float(xm),
+                        "y_px": float(y_mid),
+                        "dx_px": float(dx_px),
+                        "dx_norm": float(dx_norm),
+                    }
 
         # ---- publish vis
         out_img = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
         out_img.header = msg.header
         self.pub_img.publish(out_img)
 
-        # ---- build info
+        # ---- build info JSON
         cx = W_TARGET // 2
         info = {
             "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
@@ -736,16 +714,17 @@ class LaneCenterlineNode320x240(Node):
             "lane_count_centerline": int(len(center_sorted)),
             "lane_count_single_edge": int(len(single_edges)),
 
-            "turn": {
-                "request": self.turn_request,
-                "state": self.turn_state,
-                "locked_lane_id": int(self.locked_lane_id) if self.locked_lane_id is not None else None,
-                "selected_lane_id": int(selected_lane_id) if selected_lane_id is not None else None,
+            "lane_select": {
+                "selected_lane_id": int(self.selected_lane_id) if self.selected_lane_id in (1, 2) else None,
+                "selected_visible": bool(selected_lane is not None),
             },
 
             "lane1": None,
             "lane2": None,
             "selected": None,
+
+            # NEW:
+            "selected_line_center": selected_line_center,
 
             "lanes_centerline": [],
             "lanes_single_edge": [],
@@ -789,7 +768,6 @@ class LaneCenterlineNode320x240(Node):
                 "angle_to_vertical_abs_err": float(d["angle_to_vertical_abs_err"]),
             })
 
-        # single-edge hints
         for e in single_edges:
             info["lanes_single_edge"].append({
                 "confidence": float(e["confidence"]),

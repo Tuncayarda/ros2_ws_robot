@@ -31,6 +31,8 @@ setup(
             'lane_mask_jpegpipe_oneshot = debug.frame_test:main',
             'imu_arrow_teleop = debug.imu_control_node:main',
             'imu_pid_motion = debug.imu_pid_motion_node:main',
+            'lane_info_viewer = debug.lane_info_viewer:main',
+            'autonomus_step_0 = debug.autonomus_step_0:main',
         ],
     },
 )
