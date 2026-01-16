@@ -2,6 +2,7 @@
 import os
 import cv2
 import numpy as np
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -60,7 +61,7 @@ class LaneMaskNodeMinimal(Node):
         super().__init__("lane_mask_node")
 
         default_model = os.path.expanduser(
-            "~/ros2_ws_robot/src/lane_inference/model/lane_lraspp_mbv3_best.pth"
+            "~/ros2_ws_robot/src/lane_inference/model/lane_lraspp_mnv3_best_iou.pth"
         )
         self.declare_parameter("model_path", default_model)
         self.declare_parameter("in_topic",  "/camera/image_raw")
@@ -69,6 +70,16 @@ class LaneMaskNodeMinimal(Node):
         self.declare_parameter("img_w", 320)
         self.declare_parameter("img_h", 240)
         self.declare_parameter("thresh", 0.50)
+
+        # perf logging
+        self.declare_parameter("log_infer_ms", True)
+        self.declare_parameter("log_every_n", 30)
+
+        # CPU perf options
+        self.declare_parameter("torch_num_threads", 4)
+        self.declare_parameter("torch_num_interop_threads", 1)
+        self.declare_parameter("use_channels_last", True)
+        self.declare_parameter("use_torchscript", False)
 
         # ✅ rotation (default 180)
         self.declare_parameter("rotate_deg", 180)  # 0/90/180/270
@@ -80,6 +91,18 @@ class LaneMaskNodeMinimal(Node):
         self.img_h = int(self.get_parameter("img_h").value)
         self.thresh = float(self.get_parameter("thresh").value)
         self.rotate_deg = int(self.get_parameter("rotate_deg").value) % 360
+        self.log_infer_ms = bool(self.get_parameter("log_infer_ms").value)
+        self.log_every_n = int(self.get_parameter("log_every_n").value)
+
+        torch_num_threads = int(self.get_parameter("torch_num_threads").value)
+        torch_num_interop = int(self.get_parameter("torch_num_interop_threads").value)
+        self.use_channels_last = bool(self.get_parameter("use_channels_last").value)
+        self.use_torchscript = bool(self.get_parameter("use_torchscript").value)
+
+        if torch_num_threads > 0:
+            torch.set_num_threads(torch_num_threads)
+        if torch_num_interop > 0:
+            torch.set_num_interop_threads(torch_num_interop)
 
         if self.rotate_deg not in (0, 90, 180, 270):
             raise ValueError("rotate_deg must be one of 0,90,180,270")
@@ -97,6 +120,16 @@ class LaneMaskNodeMinimal(Node):
         self.model.load_state_dict(torch.load(self.model_path, map_location=self.device), strict=True)
         self.model.eval()
 
+        if self.use_channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+
+        if self.device.type == "cpu" and self.use_torchscript:
+            example = torch.zeros((1, 3, self.img_h, self.img_w), dtype=torch.float32)
+            if self.use_channels_last:
+                example = example.to(memory_format=torch.channels_last)
+            self.model = torch.jit.trace(self.model, example, strict=False)
+            self.model = torch.jit.optimize_for_inference(self.model)
+
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -109,14 +142,18 @@ class LaneMaskNodeMinimal(Node):
         self.sub = self.create_subscription(Image, self.in_topic, self.cb, qos)
 
         self.get_logger().info(
-            f"READY | device={self.device} | rotate_deg={self.rotate_deg} | sub={self.in_topic} -> pub={self.out_topic}"
+            f"READY | device={self.device} | model={self.model_path} | rotate_deg={self.rotate_deg} | sub={self.in_topic} -> pub={self.out_topic}"
         )
+
+        self._frame_i = 0
 
     def preprocess(self, bgr: np.ndarray) -> torch.Tensor:
         img = cv2.resize(bgr, (self.img_w, self.img_h), interpolation=cv2.INTER_AREA)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         img = (img - self.mean) / self.std
         t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous()
+        if self.use_channels_last:
+            t = t.to(memory_format=torch.channels_last)
         return t.to(self.device)
 
     def publish_mono8(self, src: Image, mono_u8: np.ndarray):
@@ -138,6 +175,7 @@ class LaneMaskNodeMinimal(Node):
 
             inp = self.preprocess(bgr)
 
+            t0 = time.perf_counter()
             with torch.inference_mode():
                 logits = self.model(inp)["out"]
                 logits = F.interpolate(
@@ -146,12 +184,19 @@ class LaneMaskNodeMinimal(Node):
                 )
                 probs = torch.softmax(logits, dim=1)[0, 1].float().cpu().numpy()
                 mask_small = (probs >= self.thresh).astype(np.uint8) * 255
+            t1 = time.perf_counter()
 
             # back to rotated image size
             h0, w0 = bgr.shape[:2]
             mask_full = cv2.resize(mask_small, (w0, h0), interpolation=cv2.INTER_NEAREST)
 
             self.publish_mono8(msg, mask_full)
+
+            if self.log_infer_ms:
+                self._frame_i += 1
+                if self._frame_i % max(1, self.log_every_n) == 0:
+                    infer_ms = (t1 - t0) * 1000.0
+                    self.get_logger().info(f"lane_mask infer: {infer_ms:.2f} ms")
 
         except Exception as e:
             self.get_logger().error(f"cb failed: {e}")

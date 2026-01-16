@@ -33,6 +33,7 @@ setup(
             'imu_pid_motion = debug.imu_pid_motion_node:main',
             'lane_info_viewer = debug.lane_info_viewer:main',
             'autonomus_step_0 = debug.autonomus_step_0:main',
+            'autonomus_step_1 = debug.autonomus_step_1:main',
         ],
     },
 )

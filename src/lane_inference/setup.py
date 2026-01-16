@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'lane_mask_node = lane_inference.lane_mask_node:main',
-            'lane_centerline_node = lane_inference.lane_centerline_node:main',
         ],
     },
 )

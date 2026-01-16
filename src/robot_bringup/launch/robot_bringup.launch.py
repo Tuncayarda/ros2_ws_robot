@@ -122,30 +122,30 @@ def generate_launch_description():
         }],
     )
 
-    lane_mask = Node(
-        package="lane_inference",
-        executable="lane_mask_node",
-        name="lane_mask_node",
-        namespace="camera_bottom",
-        output="screen",
-        parameters=[{
-            "in_topic": "/camera_bottom/camera_node/image_raw",
-            "out_topic": "/camera_bottom/lane_mask",
-            "model_path": "/home/robot/ros2_ws_robot/src/lane_inference/model/lane_lraspp_mbv3_best.pth",
-            "img_w": 320,
-            "img_h": 240,
-            "thresh": 0.5,
-            "rotate_deg": 180,
-        }],
-    )
+    # lane_mask = Node(
+    #     package="lane_inference",
+    #     executable="lane_mask_node",
+    #     name="lane_mask_node",
+    #     namespace="camera_bottom",
+    #     output="screen",
+    #     parameters=[{
+    #         "in_topic": "/camera_bottom/camera_node/image_raw",
+    #         "out_topic": "/camera_bottom/lane_mask",
+    #         "model_path": "/home/robot/ros2_ws_robot/src/lane_inference/model/lane_lraspp_mnv3_best_iou.pth",
+    #         "img_w": 320,
+    #         "img_h": 240,
+    #         "thresh": 0.5,
+    #         "rotate_deg": 180,
+    #     }],
+    # )
 
-    lane_center = Node(
-        package="lane_inference",
-        executable="lane_centerline_node",
-        name="lane_centerline_node",
-        namespace="camera_bottom",
-        output="screen",
-    )
+    # lane_center = Node(
+    #     package="lane_centerline_cpp",
+    #     executable="lane_centerline_node",
+    #     name="lane_centerline_node",
+    #     namespace="camera_bottom",
+    #     output="screen",
+    # )
 
     # --- rosbridge websocket (mobile/pc <-> ROS2) ---
     rosbridge = Node(
@@ -217,8 +217,8 @@ def generate_launch_description():
         servo,
         lcd,
         audio,
-        lane_mask,
-        lane_center,
+        # lane_mask,
+        # lane_center,
         rosbridge,
         mobile_com,
         pico_com,
