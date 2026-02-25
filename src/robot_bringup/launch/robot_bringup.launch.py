@@ -67,28 +67,6 @@ def generate_launch_description():
         }],
     )
 
-    # --- Servo driver ---
-    servo = Node(
-        package="servo_driver",
-        executable="servo_driver_node",
-        name="servo_driver_node",
-        output="screen",
-        parameters=[{
-            "chip": "/dev/gpiochip4",
-            "gpio": 12,
-            "topic": "/servo/angle_deg",
-            "min_us": 500,
-            "max_us": 2500,
-            "min_deg": 0.0,
-            "max_deg": 180.0,
-            "center_deg": 100.0,
-            "period_us": 20000,
-            "max_step_us": 15,
-            "rt_priority": 10,
-            "hold_ms": 300,
-        }],
-    )
-
     # --- Waveshare LCD ---
     lcd = Node(
         package="waveshare_lcd",
@@ -97,6 +75,7 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "fps": 20,
+            "loop": False,
             "roi_enable": True,
             "roi_pad": 2,
             "spi_hz": 20000000,
@@ -119,6 +98,18 @@ def generate_launch_description():
             "volume": 20,
             "ytdl": True,
             "alsa_device": "",
+        }],
+    )
+
+    demo_core = Node(
+        package="demo_core",
+        executable="demo_core_node",
+        name="demo_core",
+        output="screen",
+        parameters=[{
+            "sounds_dir": "/home/robot/Sounds",
+            "audio_topic": "/audio/path",
+            "servo_topic": "/servo/angle_deg",
         }],
     )
 
@@ -153,6 +144,8 @@ def generate_launch_description():
         executable="rosbridge_websocket",
         name="rosbridge_websocket",
         output="screen",
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[{
             "port": 9090,
             "address": "0.0.0.0",
@@ -174,7 +167,7 @@ def generate_launch_description():
         }],
     )
 
-    # --- Pico COM (LED TX + Sensor RX) ---
+    # --- Pico COM (LED TX + Sensor RX + Servo) ---
     pico_com = Node(
         package="pico_com",
         executable="pico_com",
@@ -188,6 +181,10 @@ def generate_launch_description():
             "frame_timeout_ms": 80,
             "log_frames": False,
             "publish_raw": False,
+            "servo_topic": "/servo/angle_deg",
+            "servo_center_deg": 134.0,
+            "servo_min_deg": 94.0,
+            "servo_max_deg": 174.0,
         }],
     )
 
@@ -214,9 +211,9 @@ def generate_launch_description():
         motor,
         camera_front,
         camera_bottom,
-        servo,
         lcd,
         audio,
+        demo_core,
         # lane_mask,
         # lane_center,
         rosbridge,

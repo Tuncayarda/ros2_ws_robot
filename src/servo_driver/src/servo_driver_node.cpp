@@ -9,6 +9,7 @@
 #include <thread>
 
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sched.h>
 #include <sys/resource.h>
 #include <time.h>
@@ -19,6 +20,9 @@ class ServoSoftPwmNode : public rclcpp::Node
 public:
   ServoSoftPwmNode() : Node("servo_driver_node")
   {
+    // Hafızayı kilitleyip page fault jitterını azalt
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+
     // ---------- Params ----------
     chip_path_   = declare_parameter<std::string>("chip", "/dev/gpiochip4");
     line_offset_ = declare_parameter<int>("gpio", 12);
@@ -27,17 +31,17 @@ public:
     min_us_    = declare_parameter<int>("min_us", 500);
     max_us_    = declare_parameter<int>("max_us", 2500);
 
-    min_deg_   = declare_parameter<double>("min_deg", 0.0);
-    max_deg_   = declare_parameter<double>("max_deg", 180.0);
+    min_deg_   = declare_parameter<double>("min_deg", 20.0);
+    max_deg_   = declare_parameter<double>("max_deg", 170.0);
 
-    center_deg_ = declare_parameter<double>("center_deg", 100.0);
+    center_deg_ = declare_parameter<double>("center_deg", 130.0);
 
     period_us_   = declare_parameter<int>("period_us", 20000); // 50Hz
-    max_step_us_ = declare_parameter<int>("max_step_us", 15);
-    rt_priority_ = declare_parameter<int>("rt_priority", 60);
+    max_step_us_ = declare_parameter<int>("max_step_us", 30);
+    rt_priority_ = declare_parameter<int>("rt_priority", 80);
 
     // PWM kesme mantığı
-    hold_ms_      = declare_parameter<int>("hold_ms", 250);     // hedefe geldikten sonra kaç ms daha basıp bırakacak
+    hold_ms_      = declare_parameter<int>("hold_ms", 400);     // hedefe geldikten sonra kaç ms daha basıp bırakacak
     deadband_us_  = declare_parameter<int>("deadband_us", 6);   // hedefe "yakın" kabul aralığı (us)
 
     // ---------- GPIO ----------
@@ -61,7 +65,7 @@ public:
       topic_, 10,
       [this](const std_msgs::msg::Float32 &msg)
       {
-        // MOBILDEN GELEN: -40..0..+40
+        // MOBILDEN GELEN: -50..0..+50 (offset)
         const double offset = -msg.data;
 
         double desired_deg = center_deg_ + offset;
@@ -115,6 +119,13 @@ private:
     clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
   }
 
+  static void sleep_until_ns(long long target_ns)
+  {
+    if (target_ns <= 0) return;
+    timespec ts{ target_ns / 1'000'000'000LL, target_ns % 1'000'000'000LL };
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+  }
+
   void try_rt()
   {
     setpriority(PRIO_PROCESS, 0, -10);
@@ -127,11 +138,12 @@ private:
   {
     long period_ns = period_us_ * 1000L;
     long high_ns   = pulse_us * 1000L;
+    const long long start = now_ns();
 
     gpiod_line_set_value(line_, 1);
-    sleep_ns(high_ns);
+    sleep_until_ns(start + high_ns);
     gpiod_line_set_value(line_, 0);
-    sleep_ns(period_ns - high_ns);
+    sleep_until_ns(start + period_ns);
   }
 
   void worker_loop()

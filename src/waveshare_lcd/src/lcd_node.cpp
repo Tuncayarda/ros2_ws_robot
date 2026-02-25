@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <filesystem>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +22,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/empty.hpp"
 #include "sensor_msgs/msg/image.hpp"
 
 using namespace std::chrono_literals;
@@ -47,6 +50,13 @@ static inline bool ends_with_ci(const std::string& s, const std::string& suffix)
   return a == b;
 }
 
+static inline bool starts_with_ci(const std::string& s, const std::string& prefix) {
+  if (prefix.size() > s.size()) return false;
+  std::string a = to_lower(s.substr(0, prefix.size()));
+  std::string b = to_lower(prefix);
+  return a == b;
+}
+
 class LcdNode : public rclcpp::Node {
 public:
   LcdNode()
@@ -61,19 +71,27 @@ public:
     declare_parameter<bool>("loop", true);
     declare_parameter<bool>("show_test", false);
     declare_parameter<bool>("rotate_cw_90", true);
+    declare_parameter<bool>("mirror_horizontal", false);
+    declare_parameter<bool>("mirror_vertical", true);
 
     // ---------- SPI params ----------
     declare_parameter<int>("spi_hz", 20000000);
-    declare_parameter<int>("spi_chunk", 32768);          // ✅ bigger default
+    declare_parameter<int>("spi_chunk", 30000);          // ✅ bigger default
     declare_parameter<bool>("spi_use_multi_ioc", false); // optional advanced mode
 
     // ---------- Topics ----------
     declare_parameter<std::string>("topic_media_path", "/lcd/media_path");
     declare_parameter<std::string>("topic_image", "/lcd/image");
+    declare_parameter<std::string>("topic_stop", "/lcd/stop");
 
     // ---------- ROI params ----------
     declare_parameter<bool>("roi_enable", true);
     declare_parameter<int>("roi_pad", 2);
+
+    // ---------- Idle params ----------
+    declare_parameter<bool>("idle_enable", true);
+    declare_parameter<std::string>("idle_dir", "/home/robot/Emojis");
+    declare_parameter<std::string>("idle_prefix", "Idle_");
 
     // ---------- Apply params ----------
     reload_params();
@@ -101,9 +119,19 @@ public:
       }
     );
 
+    sub_stop_ = create_subscription<std_msgs::msg::Empty>(
+      topic_stop_, 10,
+      [this](std_msgs::msg::Empty::SharedPtr){
+        on_stop();
+      }
+    );
+
     // ---------- SPI worker thread ----------
     running_.store(true);
     spi_worker_ = std::thread([this]{ spi_worker_loop(); });
+
+    // ---------- Idle resume timer ----------
+    idle_timer_ = create_wall_timer(200ms, [this]{ idle_tick(); });
 
     // ---------- test ----------
     if (show_test_) {
@@ -113,6 +141,7 @@ public:
     } else {
       fill_screen(0x0000);
       RCLCPP_INFO(get_logger(), "Ready. Publish /lcd/media_path or /lcd/image to start.");
+      start_idle_playback_if_needed();
     }
 
     RCLCPP_INFO(get_logger(),
@@ -148,6 +177,8 @@ private:
     loop_ = get_parameter("loop").as_bool();
     show_test_ = get_parameter("show_test").as_bool();
     rotate_cw_90_ = get_parameter("rotate_cw_90").as_bool();
+    mirror_horizontal_ = get_parameter("mirror_horizontal").as_bool();
+    mirror_vertical_ = get_parameter("mirror_vertical").as_bool();
 
     spi_hz_ = std::max<int>(1000000, (int)get_parameter("spi_hz").as_int());
     spi_chunk_ = std::max<int>(256, (int)get_parameter("spi_chunk").as_int());
@@ -155,9 +186,14 @@ private:
 
     topic_media_path_ = get_parameter("topic_media_path").as_string();
     topic_image_      = get_parameter("topic_image").as_string();
+    topic_stop_       = get_parameter("topic_stop").as_string();
 
     roi_enable_ = get_parameter("roi_enable").as_bool();
     roi_pad_    = std::max<int>(0, (int)get_parameter("roi_pad").as_int());
+
+    idle_enable_ = get_parameter("idle_enable").as_bool();
+    idle_dir_ = get_parameter("idle_dir").as_string();
+    idle_prefix_ = get_parameter("idle_prefix").as_string();
   }
 
   // ---------------- SPI ----------------
@@ -356,6 +392,44 @@ private:
            ends_with_ci(p, ".jpeg") || ends_with_ci(p, ".bmp");
   }
 
+  bool is_video_path(const std::string& p) {
+    return ends_with_ci(p, ".mp4") || ends_with_ci(p, ".avi") ||
+           ends_with_ci(p, ".mkv") || ends_with_ci(p, ".mov") ||
+           ends_with_ci(p, ".m4v") || ends_with_ci(p, ".webm");
+  }
+
+  std::vector<std::string> find_idle_videos() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(idle_dir_, ec)) return out;
+
+    for (const auto& entry : std::filesystem::directory_iterator(idle_dir_, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      const auto path = entry.path().string();
+      const auto name = entry.path().filename().string();
+      if (!starts_with_ci(name, idle_prefix_)) continue;
+      if (!is_video_path(path)) continue;
+      out.push_back(path);
+    }
+    return out;
+  }
+
+  void start_idle_playback_if_needed() {
+    if (!idle_enable_) return;
+    if (media_running_.load()) return;
+
+    if (media_thread_.joinable()) {
+      media_thread_.join();
+    }
+
+    media_running_.store(true);
+    const uint64_t my_token = play_token_.load();
+    media_thread_ = std::thread([this, my_token]{
+      idle_loop(my_token);
+    });
+  }
+
   void on_media_path(const std::string& path) {
     if (path.empty()) return;
 
@@ -396,6 +470,11 @@ private:
                 msg.width, msg.height, msg.encoding.c_str());
 
     render_bgr_frame_enqueue(bgr);
+  }
+
+  void on_stop() {
+    stop_current_playback();
+    start_idle_playback_if_needed();
   }
 
   bool image_msg_to_bgr(const sensor_msgs::msg::Image& msg, cv::Mat& out_bgr) {
@@ -442,6 +521,67 @@ private:
       next += period;
       std::this_thread::sleep_until(next);
     }
+
+    if (!loop_ && media_running_.load() && play_token_.load() == token) {
+      media_running_.store(false);
+      idle_resume_requested_.store(true);
+    }
+  }
+
+  void idle_tick() {
+    if (!idle_enable_) return;
+    if (!idle_resume_requested_.load()) return;
+    if (media_running_.load()) return;
+
+    idle_resume_requested_.store(false);
+    start_idle_playback_if_needed();
+  }
+
+  void play_video_once(const std::string& path, uint64_t token) {
+    cv::VideoCapture cap(path);
+    if (!cap.isOpened()) {
+      RCLCPP_WARN(get_logger(), "Failed to open idle video: %s", path.c_str());
+      return;
+    }
+
+    const auto period = std::chrono::nanoseconds((long long)(1e9 / fps_));
+    auto next = std::chrono::steady_clock::now();
+
+    cv::Mat frame;
+    while (media_running_.load()) {
+      if (play_token_.load() != token) break;
+
+      if (!cap.read(frame) || frame.empty()) {
+        break;
+      }
+
+      render_bgr_frame_enqueue(frame);
+
+      next += period;
+      std::this_thread::sleep_until(next);
+    }
+  }
+
+  void idle_loop(uint64_t token) {
+    std::mt19937 rng{std::random_device{}()};
+    while (media_running_.load()) {
+      if (play_token_.load() != token) break;
+
+      auto files = find_idle_videos();
+      if (files.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Idle enabled but no Idle_* videos found in %s", idle_dir_.c_str());
+        std::this_thread::sleep_for(1s);
+        continue;
+      }
+
+      std::shuffle(files.begin(), files.end(), rng);
+      for (const auto& p : files) {
+        if (!media_running_.load()) return;
+        if (play_token_.load() != token) return;
+        play_video_once(p, token);
+      }
+    }
   }
 
   // ---------------- Producer: frame->rgb565 + ROI compute -> enqueue ----------------
@@ -453,6 +593,13 @@ private:
 
     cv::Mat resized;
     cv::resize(rotated, resized, cv::Size(LCD_WIDTH, LCD_HEIGHT), 0, 0, cv::INTER_LINEAR);
+
+    if (mirror_horizontal_) {
+      cv::flip(resized, resized, 1);
+    }
+    if (mirror_vertical_) {
+      cv::flip(resized, resized, 0);
+    }
 
     // cur565 as uint16
     std::vector<uint16_t> cur565((size_t)LCD_WIDTH * (size_t)LCD_HEIGHT);
@@ -572,6 +719,8 @@ private:
   bool loop_{true};
   bool show_test_{false};
   bool rotate_cw_90_{true};
+  bool mirror_horizontal_{false};
+  bool mirror_vertical_{false};
 
   int spi_hz_{20000000};
   int spi_chunk_{32768};
@@ -579,9 +728,14 @@ private:
 
   std::string topic_media_path_{"/lcd/media_path"};
   std::string topic_image_{"/lcd/image"};
+  std::string topic_stop_{"/lcd/stop"};
 
   bool roi_enable_{true};
   int roi_pad_{2};
+
+  bool idle_enable_{true};
+  std::string idle_dir_{"/home/robot/Emojis"};
+  std::string idle_prefix_{"Idle_"};
 
   // hw
   int spi_fd_;
@@ -592,12 +746,15 @@ private:
   // ros
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_path_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr idle_timer_;
 
   // playback
   std::atomic<bool> media_running_{false};
   std::thread media_thread_;
   std::atomic<uint64_t> play_token_{1};
+  std::atomic<bool> idle_resume_requested_{false};
 
   // SPI worker
   std::atomic<bool> running_{false};

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import signal
 import subprocess
 import json
 import socket
@@ -294,17 +293,6 @@ def main():
             pass
 
     atexit.register(_final_cleanup)
-
-    def _handle_signal(_signum, _frame):
-        _final_cleanup()
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        os._exit(0)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
         rclpy.spin(node)

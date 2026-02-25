@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import UInt8, UInt16, Int16, UInt8MultiArray
+from std_msgs.msg import UInt8, UInt16, Int16, Float32, UInt8MultiArray
 
 import serial
 
@@ -17,7 +17,8 @@ SOF2 = 0x55
 VER  = 0x01
 
 # ROS -> Pico (TX)
-T_SET_CONFIG = 0x01
+T_SET_CONFIG       = 0x01
+T_SET_SERVO_ANGLE  = 0x05
 
 # Pico -> ROS (RX)
 T_SENSOR_TELEM = 0x20
@@ -86,6 +87,11 @@ class PicoComNode(Node):
         self.declare_parameter("auto_reopen", True)
         self.declare_parameter("reopen_sec", 1.0)
 
+        self.declare_parameter("servo_topic", "/servo/angle_deg")
+        self.declare_parameter("servo_center_deg", 134.0)
+        self.declare_parameter("servo_min_deg", 94.0)
+        self.declare_parameter("servo_max_deg", 174.0)
+
         self.port = self.get_parameter("port").value
         self.baud = int(self.get_parameter("baud").value)
         self.send_hz = max(1, int(self.get_parameter("send_hz").value))
@@ -95,6 +101,11 @@ class PicoComNode(Node):
         self.publish_raw = bool(self.get_parameter("publish_raw").value)
         self.auto_reopen = bool(self.get_parameter("auto_reopen").value)
         self.reopen_sec = float(self.get_parameter("reopen_sec").value)
+
+        self.servo_topic = str(self.get_parameter("servo_topic").value)
+        self.servo_center = float(self.get_parameter("servo_center_deg").value)
+        self.servo_min = float(self.get_parameter("servo_min_deg").value)
+        self.servo_max = float(self.get_parameter("servo_max_deg").value)
 
         # ------------- Serial -------------
         self.ser_lock = threading.Lock()
@@ -113,6 +124,9 @@ class PicoComNode(Node):
         self.sub_speed = self.create_subscription(UInt16, "/led/speed_ms", self.cb_speed, 10)
         self.sub_bri = self.create_subscription(UInt8, "/led/brightness", self.cb_brightness, 10)
         self.sub_colors = self.create_subscription(UInt8MultiArray, "/led/colors", self.cb_colors, 10)
+
+        # ------------- ROS Subscriber (Servo) -------------
+        self.sub_servo = self.create_subscription(Float32, self.servo_topic, self.cb_servo, 10)
 
         # ------------- ROS Publishers (Telemetry) -------------
         # (TOPICS MUST STAY SAME)
@@ -148,7 +162,7 @@ class PicoComNode(Node):
         self.rx_timer = self.create_timer(1.0 / float(self.rx_hz), self.rx_tick)
 
         self.get_logger().info(
-            "Listening: /led/mode /led/speed_ms /led/brightness /led/colors | "
+            f"Listening: /led/* + {self.servo_topic} | "
             "Publishing: /pico/* telemetry (fixed topics)"
         )
 
@@ -243,6 +257,28 @@ class PicoComNode(Node):
             self.cfg.A = (rA, gA, bA)
             self.cfg.B = (rB, gB, bB)
         self.mark_dirty()
+
+    # ===================== Servo callback =====================
+    def cb_servo(self, msg: Float32):
+        """Same logic as old servo_driver_node: offset -> absolute angle -> send to Pico."""
+        offset = -msg.data
+        desired_deg = self.servo_center + offset
+        desired_deg = max(self.servo_min, min(self.servo_max, desired_deg))
+        angle_byte = clamp_u8(int(round(desired_deg)))
+
+        frame = self._build_servo_frame(angle_byte)
+        ok = self._serial_write(frame)
+        if ok and self.log_frames:
+            self.get_logger().info(f"TX servo angle={angle_byte}° ({len(frame)} bytes)")
+
+    def _build_servo_frame(self, angle: int) -> bytes:
+        payload = bytes([angle & 0xFF])
+        ln = len(payload)
+        frame = bytearray([SOF1, SOF2, VER, T_SET_SERVO_ANGLE, ln])
+        frame.extend(payload)
+        c = crc8(frame[2:])  # VER..TYPE..LEN..PAYLOAD
+        frame.append(c)
+        return bytes(frame)
 
     # ===================== Frame builder (TX) =====================
     def build_set_config_frame(self, cfg: LedConfig) -> bytes:
